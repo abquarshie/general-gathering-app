@@ -1,0 +1,14 @@
+# Theme for the General Gathering Management Portal.
+# Keep this file in the repo; it ships with the app.
+
+[theme]
+base = "light"
+primaryColor = "#16202b"          # ink — buttons, focus rings
+backgroundColor = "#fdfcfa"
+secondaryBackgroundColor = "#f7f5f0"   # paper — sidebar, table headers
+textColor = "#16202b"
+font = "sans serif"
+
+[server]
+# Keeps uploads sensible for the backup restore
+maxUploadSize = 5

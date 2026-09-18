@@ -1,7 +1,2 @@
-streamlit
-streamlit-authenticator
-gspread
-oauth2client
-pandas
-python-docx
-openpyxl
+streamlit>=1.49
+pandas>=2.0
