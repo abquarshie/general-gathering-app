@@ -55,7 +55,19 @@ DEFAULT_SHIFTS = [
 TIME_PATTERN = r"^([01][0-9]|2[0-3]):[0-5][0-9]$"
 
 VOLUNTEER_STATUSES = ["Confirmed", "Invited", "Unavailable", "Moved out"]
-VOLUNTEER_COLUMNS = ["Name", "Department", "Shift", "Status", "Phone", "Notes"]
+GENDERS = ["Male", "Female"]
+PRIVILEGES = ["Elder", "Servant", "Publisher"]
+VOLUNTEER_COLUMNS = [
+    "Name",
+    "Gender",
+    "Privilege",
+    "Department",
+    "Shift",
+    "Status",
+    "Phone",
+    "Notes",
+]
+TARGET_COLUMNS = ["Department", "Shift", "Needed", "Min elders", "Min servants"]
 
 CHECKLIST = {
     "Overseer": [
@@ -154,6 +166,7 @@ html, body, [class*="css"] { font-feature-settings: "tnum" 1; }
 .row .name  { font-weight: 600; }
 .row .owner { color: var(--ink-soft); font-size: .85rem; font-weight: 400; margin-left: .5rem; }
 .row .state { font-size: .85rem; color: var(--ink-soft); white-space: nowrap; }
+.row .short { color: var(--signal); font-weight: 600; }
 
 .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: .35rem 0 1rem; }
 .bar > span { display: block; height: 100%; background: var(--ink); }
@@ -185,8 +198,11 @@ def load_store() -> dict:
 
 
 def save_store(store: dict) -> None:
+    """Write the whole store atomically, so a crash can't leave a half file."""
     DATA_DIR.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps(store, indent=2, default=str))
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(store, indent=2, default=str))
+    tmp.replace(STATE_FILE)
 
 
 def blank_event(event_date: date) -> dict:
@@ -196,6 +212,7 @@ def blank_event(event_date: date) -> dict:
         "checklist": {},
         "departments": {d: dict(DEPT_FIELDS) for d in ALL_DEPTS},
         "shifts": [dict(s) for s in DEFAULT_SHIFTS],
+        "targets": [],
         "volunteers": [],
     }
 
@@ -206,14 +223,23 @@ def migrate(ev: dict) -> dict:
     ev.setdefault("checklist", {})
     ev.setdefault("volunteers", [])
     ev.setdefault("departments", {})
+    ev.setdefault("targets", [])
     if not ev.get("shifts"):
         ev["shifts"] = [dict(s) for s in DEFAULT_SHIFTS]
     return ev
 
 
 def persist() -> None:
-    st.session_state.store[st.session_state.event_key] = st.session_state.event
-    save_store(st.session_state.store)
+    """Save the current gathering, keeping other gatherings as they are on disk.
+
+    Re-reading first means the overseer and the assistant working at the same
+    time can't wipe each other's other gatherings. Within one gathering the
+    last save still wins — move to Postgres if that matters.
+    """
+    on_disk = load_store()
+    on_disk[st.session_state.event_key] = st.session_state.event
+    st.session_state.store = on_disk
+    save_store(on_disk)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +390,11 @@ with st.sidebar:
         persist()
 
     st.divider()
+    if Path("/mount/src").exists():
+        st.warning(
+            "This is Streamlit Cloud, where saved data is wiped on every redeploy. "
+            "Download a backup from the Export tab before you finish."
+        )
     if st.button("Sign out"):
         st.session_state.role = None
         st.rerun()
@@ -417,6 +448,70 @@ def shift_hours(name: str) -> str:
     return ""
 
 
+def targets_df() -> pd.DataFrame:
+    """One row per department and shift, carrying over anything already set."""
+    saved = {
+        (str(t.get("Department")), str(t.get("Shift"))): t for t in event.get("targets", [])
+    }
+    rows = []
+    for dept in ALL_DEPTS:
+        for shift in shift_names():
+            t = saved.get((dept, shift), {})
+            rows.append(
+                {
+                    "Department": dept,
+                    "Shift": shift,
+                    "Needed": int(t.get("Needed") or 0),
+                    "Min elders": int(t.get("Min elders") or 0),
+                    "Min servants": int(t.get("Min servants") or 0),
+                }
+            )
+    return pd.DataFrame(rows, columns=TARGET_COLUMNS)
+
+
+def target_for(dept: str, shift: str) -> dict:
+    for t in event.get("targets", []):
+        if str(t.get("Department")) == dept and str(t.get("Shift")) == shift:
+            return t
+    return {"Needed": 0, "Min elders": 0, "Min servants": 0}
+
+
+def staffing_rows() -> list[dict]:
+    """Have-versus-need for every department and shift with a target set."""
+    df = volunteers_df()
+    counted = df[(df["Name"].str.strip() != "") & (df["Status"] == "Confirmed")] if not df.empty else df
+    out = []
+    for t in event.get("targets", []):
+        needed = int(t.get("Needed") or 0)
+        min_e = int(t.get("Min elders") or 0)
+        min_s = int(t.get("Min servants") or 0)
+        if not (needed or min_e or min_s):
+            continue
+        dept, shift = str(t.get("Department")), str(t.get("Shift"))
+        pool = (
+            counted[(counted["Department"] == dept) & (counted["Shift"] == shift)]
+            if not counted.empty
+            else counted
+        )
+        have = len(pool)
+        elders = int((pool["Privilege"] == "Elder").sum()) if have else 0
+        servants = int((pool["Privilege"] == "Servant").sum()) if have else 0
+        out.append(
+            {
+                "Department": dept,
+                "Shift": shift,
+                "have": have,
+                "needed": needed,
+                "short": max(needed - have, 0),
+                "elders": elders,
+                "min_elders": min_e,
+                "servants": servants,
+                "min_servants": min_s,
+            }
+        )
+    return out
+
+
 def dept_progress(dept: str) -> tuple[int, int]:
     d = event["departments"].setdefault(dept, dict(DEPT_FIELDS))
     checks = [
@@ -464,8 +559,8 @@ if late:
         unsafe_allow_html=True,
     )
 
-tab_overview, tab_depts, tab_vols, tab_export = st.tabs(
-    ["Readiness", "Departments", "Volunteers", "Export"]
+tab_overview, tab_depts, tab_vols, tab_follow, tab_export = st.tabs(
+    ["Readiness", "Departments", "Volunteers", "Follow-up", "Export"]
 )
 
 # ---------------------------------------------------------------------------
@@ -495,15 +590,28 @@ with tab_overview:
 
     with right:
         st.markdown("#### Departments")
+        staffing = staffing_rows()
+        by_dept: dict[str, dict[str, int]] = {}
+        for s in staffing:
+            agg = by_dept.setdefault(s["Department"], {"have": 0, "needed": 0, "short": 0})
+            agg["have"] += s["have"]
+            agg["needed"] += s["needed"]
+            agg["short"] += s["short"]
+
         ready_total = 0
         for dept in ALL_DEPTS:
             d_done, d_total = dept_progress(dept)
             ready_total += d_done == d_total
+            agg = by_dept.get(dept)
+            if agg and agg["needed"]:
+                staff = f' &nbsp;·&nbsp; <span class="{"short" if agg["short"] else ""}">{agg["have"]}/{agg["needed"]} volunteers</span>'
+            else:
+                staff = ""
             st.markdown(
                 f'<div class="row {status_class(d_done, d_total)}">'
                 f'<span><span class="name">{dept}</span>'
                 f'<span class="owner">{DEPT_OWNER[dept]}</span></span>'
-                f'<span class="state">{d_done}/{d_total} steps</span></div>',
+                f'<span class="state">{d_done}/{d_total} steps{staff}</span></div>',
                 unsafe_allow_html=True,
             )
         st.markdown(
@@ -511,6 +619,40 @@ with tab_overview:
             f'departments fully prepared</p>',
             unsafe_allow_html=True,
         )
+
+        gaps = []
+        for s in staffing:
+            bits = []
+            if s["short"]:
+                bits.append(f"{s['short']} more")
+            if s["elders"] < s["min_elders"]:
+                bits.append(f"{s['min_elders'] - s['elders']} more elder(s)")
+            if s["servants"] < s["min_servants"]:
+                bits.append(f"{s['min_servants'] - s['servants']} more servant(s)")
+            if bits:
+                gaps.append(f"{s['Department']}, {s['Shift']}: {', '.join(bits)}")
+
+        st.markdown("#### Still short")
+        if not staffing:
+            st.markdown(
+                '<p class="note">No headcount set yet. Enter how many each department '
+                'needs per shift on the Departments tab, and shortfalls appear here.</p>',
+                unsafe_allow_html=True,
+            )
+        elif gaps:
+            total_short = sum(s["short"] for s in staffing)
+            st.markdown(
+                f'<p class="note">{total_short} confirmed volunteers short across '
+                f'{len(gaps)} shifts.</p>',
+                unsafe_allow_html=True,
+            )
+            for g in gaps:
+                st.markdown(f'<div class="row behind"><span>{g}</span></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<p class="note">Every shift with a target set is fully staffed.</p>',
+                unsafe_allow_html=True,
+            )
 
 # ---------------------------------------------------------------------------
 # Tab 2 — Departments
@@ -555,6 +697,36 @@ with tab_depts:
             )
             persist()
             st.success(f"{dept} saved.")
+
+    st.markdown("#### How many are needed")
+    st.markdown(
+        '<p class="note">Set the headcount per shift. Leave a row at zero if that '
+        'department does not work that shift. Only confirmed volunteers count towards it.</p>',
+        unsafe_allow_html=True,
+    )
+    dept_targets = targets_df()
+    dept_targets = dept_targets[dept_targets["Department"] == dept].set_index("Shift")
+    edited_targets = st.data_editor(
+        dept_targets[["Needed", "Min elders", "Min servants"]],
+        num_rows="fixed",
+        width="stretch",
+        key=f"targets_{event_key}_{dept}",
+        column_config={
+            "Needed": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
+            "Min elders": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
+            "Min servants": st.column_config.NumberColumn(min_value=0, step=1, width="small"),
+        },
+    )
+
+    kept = [t for t in event.get("targets", []) if str(t.get("Department")) != dept]
+    for shift_name, row in edited_targets.iterrows():
+        values = {k: int(row.get(k) or 0) for k in ("Needed", "Min elders", "Min servants")}
+        if any(values.values()):
+            kept.append({"Department": dept, "Shift": str(shift_name), **values})
+    if kept != event.get("targets", []):
+        event["targets"] = kept
+        persist()
+        st.rerun()
 
     df = volunteers_df()
     assigned = df[df["Department"] == dept] if not df.empty else df
@@ -615,14 +787,40 @@ with tab_vols:
         unsafe_allow_html=True,
     )
 
+    base = volunteers_df()
+    f1, f2, f3, f4 = st.columns([2, 2, 1.5, 1.5])
+    search = f1.text_input("Find by name", key=f"f_name_{event_key}")
+    f_dept = f2.multiselect("Department", ALL_DEPTS, key=f"f_dept_{event_key}")
+    f_shift = f3.multiselect("Shift", shift_names(), key=f"f_shift_{event_key}")
+    f_status = f4.multiselect("Status", VOLUNTEER_STATUSES, key=f"f_status_{event_key}")
+
+    filtering = bool(search.strip() or f_dept or f_shift or f_status)
+    view = base
+    if filtering and not base.empty:
+        mask = pd.Series(True, index=base.index)
+        if search.strip():
+            mask &= base["Name"].str.contains(search.strip(), case=False, na=False)
+        if f_dept:
+            mask &= base["Department"].isin(f_dept)
+        if f_shift:
+            mask &= base["Shift"].isin(f_shift)
+        if f_status:
+            mask &= base["Status"].isin(f_status)
+        view = base[mask]
+        st.caption(
+            f"{len(view)} of {len(base)} volunteers. Clear the filters to add or delete rows."
+        )
+
     edited = st.data_editor(
-        volunteers_df(),
-        num_rows="dynamic",
+        view,
+        num_rows="fixed" if filtering else "dynamic",
         hide_index=True,
         width="stretch",
         key=f"vol_editor_{event_key}",
         column_config={
             "Name": st.column_config.TextColumn(required=True, width="medium"),
+            "Gender": st.column_config.SelectboxColumn(options=GENDERS, width="small"),
+            "Privilege": st.column_config.SelectboxColumn(options=PRIVILEGES, width="small"),
             "Department": st.column_config.SelectboxColumn(options=ALL_DEPTS, width="medium"),
             "Shift": st.column_config.SelectboxColumn(options=shift_names(), width="small"),
             "Status": st.column_config.SelectboxColumn(options=VOLUNTEER_STATUSES, width="small"),
@@ -631,7 +829,13 @@ with tab_vols:
         },
     )
 
-    records = edited.fillna("").to_dict("records")
+    if filtering:
+        merged = base.copy()
+        merged.loc[edited.index] = edited
+        records = merged.fillna("").to_dict("records")
+    else:
+        records = edited.fillna("").to_dict("records")
+
     if records != event.get("volunteers", []):
         event["volunteers"] = records
         persist()
@@ -674,6 +878,84 @@ with tab_vols:
             " · ".join(f"{n} {shift_hours(n)}".strip() for n in shift_names() if shift_hours(n))
         )
         st.dataframe(summary, width="stretch")
+
+        mix = pd.DataFrame(index=ALL_DEPTS)
+        for p in PRIVILEGES:
+            mix[p] = named[named["Privilege"] == p].groupby("Department").size()
+        for g in GENDERS:
+            mix[g] = named[named["Gender"] == g].groupby("Department").size()
+        mix = mix.fillna(0).astype(int)
+        st.markdown("#### Make-up of each department")
+        st.caption("Everyone on the list, whatever their status")
+        st.dataframe(mix, width="stretch")
+
+# ---------------------------------------------------------------------------
+# Tab 4 — Follow-up
+# ---------------------------------------------------------------------------
+
+with tab_follow:
+    df = volunteers_df()
+    named = df[df["Name"].str.strip() != ""] if not df.empty else df
+    pending = named[named["Status"] == "Invited"] if not named.empty else named
+
+    st.markdown("#### Who still owes you an answer")
+    st.markdown(
+        f'<p class="note">{"Recruitment closed " + f"{-days_to_deadline} days ago" if late else f"{days_to_deadline} days until recruitment closes"}.</p>',
+        unsafe_allow_html=True,
+    )
+
+    if pending.empty:
+        st.markdown(
+            '<p class="note">Nobody is sitting at Invited. Everyone on the list has '
+            'either confirmed or been marked unavailable.</p>',
+            unsafe_allow_html=True,
+        )
+    else:
+        counts = pending.groupby("Department").size().sort_values(ascending=False)
+        for dept_name, n in counts.items():
+            st.markdown(
+                f'<div class="row part"><span class="name">{dept_name}</span>'
+                f'<span class="state">{n} awaiting reply</span></div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("#### Chase list")
+        chase_dept = st.selectbox(
+            "Department", ["All"] + sorted(counts.index.tolist()), key="chase_dept"
+        )
+        rows = pending if chase_dept == "All" else pending[pending["Department"] == chase_dept]
+        st.dataframe(
+            rows[["Name", "Department", "Shift", "Phone", "Notes"]],
+            hide_index=True,
+            width="stretch",
+        )
+
+        lines = [f"General Gathering {part}, {int(year)} — {event_date:%d %B}"]
+        for dept_name, group in rows.groupby("Department"):
+            lines.append(f"\n{dept_name}:")
+            for _, v in group.iterrows():
+                phone = f" — {v['Phone']}" if str(v["Phone"]).strip() else ""
+                lines.append(f"  {v['Name']} ({v['Shift']}){phone}")
+        st.text_area(
+            "Copy this into a message",
+            "\n".join(lines),
+            height=200,
+            key="chase_text",
+        )
+
+    no_phone = named[named["Phone"].str.strip() == ""] if not named.empty else named
+    if not no_phone.empty:
+        st.markdown("#### Missing phone numbers")
+        st.markdown(
+            f'<p class="note">{len(no_phone)} people have no number on file, so they '
+            'cannot be reached if the date or time changes.</p>',
+            unsafe_allow_html=True,
+        )
+        st.dataframe(
+            no_phone[["Name", "Department", "Shift", "Status"]],
+            hide_index=True,
+            width="stretch",
+        )
 
 # ---------------------------------------------------------------------------
 # Tab 4 — Export
@@ -835,3 +1117,20 @@ with tab_export:
         save_store(st.session_state.store)
         st.success("Backup restored.")
         st.rerun()
+
+    with st.expander("Delete this gathering's data"):
+        st.markdown(
+            f'<p class="note">This file holds the names, phone numbers and privileges '
+            f'of {len(volunteers_df())} people. Once the gathering is over and the '
+            'reports are filed, delete it rather than leaving it on a laptop. Download '
+            'a backup first if head office may ask for figures later.</p>',
+            unsafe_allow_html=True,
+        )
+        sure = st.checkbox(f"Yes, delete everything for {event_key}", key="del_sure")
+        if st.button("Delete now", disabled=not sure):
+            store = load_store()
+            store.pop(event_key, None)
+            save_store(store)
+            st.session_state.store = store
+            st.success(f"{event_key} deleted.")
+            st.rerun()
