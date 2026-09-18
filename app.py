@@ -222,11 +222,61 @@ def persist() -> None:
 
 
 def configured_users() -> dict | None:
-    """Users from .streamlit/secrets.toml, or None when the file is absent."""
+    """Users from secrets, or None when no usable [users] block is found.
+
+    Streamlit only finds .streamlit/secrets.toml relative to the folder you
+    launched it from, so we also look next to this file.
+    """
     try:
-        return dict(st.secrets["users"])
+        users = dict(st.secrets["users"])
+        if users:
+            return users
     except Exception:
-        return None
+        pass
+
+    local = Path(__file__).parent / ".streamlit" / "secrets.toml"
+    if local.exists():
+        try:
+            import tomllib
+
+            return dict(tomllib.loads(local.read_text()).get("users") or {}) or None
+        except Exception:
+            return None
+    return None
+
+
+def secrets_report() -> list[str]:
+    """Plain-language notes about where credentials are coming from."""
+    notes = [f"Streamlit was started from: {Path.cwd()}"]
+    cwd_file = Path.cwd() / ".streamlit" / "secrets.toml"
+    app_file = Path(__file__).parent / ".streamlit" / "secrets.toml"
+    for label, p in (("Launch folder", cwd_file), ("Next to app.py", app_file)):
+        notes.append(f"{label}: {p} — {'found' if p.exists() else 'not found'}")
+
+    stray = sorted(
+        str(p.name)
+        for d in {cwd_file.parent, app_file.parent}
+        if d.exists()
+        for p in d.glob("secrets.toml.*")
+    )
+    if stray:
+        notes.append("Files that need renaming to secrets.toml: " + ", ".join(stray))
+
+    users = configured_users()
+    if users:
+        notes.append("Accounts loaded: " + ", ".join(sorted(users)))
+        for name, rec in users.items():
+            h = str(rec.get("password_sha256", "")).strip()
+            if name != name.strip().lower():
+                notes.append(f"'{name}' has capitals or spaces; sign-in lowercases the name")
+            if len(h) != 64:
+                notes.append(f"'{name}' hash is {len(h)} characters, expected 64")
+            if rec.get("role") not in ("Overseer", "Assistant Overseer"):
+                notes.append(f"'{name}' role {rec.get('role')!r} is not one the app knows")
+    else:
+        notes.append("No accounts loaded, so only the demo sign-ins work.")
+        notes.append("Section headers must read [users.overseer], not [overseer].")
+    return notes
 
 
 def check_login(username: str, password: str) -> str | None:
@@ -259,9 +309,13 @@ def login_screen() -> None:
                 st.error("That username and password don't match. Check for stray spaces and try again.")
     if not configured_users():
         st.info(
-            "No credentials found in secrets, so demo logins are active. "
-            "Add a `[users]` block to `.streamlit/secrets.toml` before sharing this app."
+            "No credentials found in secrets, so demo logins are active "
+            "(overseer / pass123). Add a `[users]` block to "
+            "`.streamlit/secrets.toml` before sharing this app."
         )
+    with st.expander("Trouble signing in?"):
+        for note in secrets_report():
+            st.markdown(f'<p class="note">{note}</p>', unsafe_allow_html=True)
 
 
 if "role" not in st.session_state:
