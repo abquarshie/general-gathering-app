@@ -9,6 +9,7 @@ Needs: streamlit >= 1.49, pandas. psycopg[binary] for Neon, gspread for Sheets.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -38,11 +39,21 @@ TIME_PATTERN = r"^([01][0-9]|2[0-3]):[0-5][0-9]$"
 GENDERS = ["Male", "Female"]
 PRIVILEGES = ["Elder", "Servant", "Publisher"]
 VOLUNTEER_STATUSES = ["Confirmed", "Invited", "Unavailable", "Moved out"]
-VOLUNTEER_COLUMNS = ["Name", "Gender", "Privilege", "Department", "Shift", "Status", "Notes"]
+VOLUNTEER_COLUMNS = [
+    "Name",
+    "Gender",
+    "Privilege",
+    "Congregation",
+    "Department",
+    "Shift",
+    "Status",
+    "Notes",
+]
 DB_FIELDS = {
     "Name": "name",
     "Gender": "gender",
     "Privilege": "privilege",
+    "Congregation": "congregation",
     "Department": "dept",
     "Shift": "shift",
     "Status": "status",
@@ -190,11 +201,16 @@ def secrets_report() -> list[str]:
     if users:
         notes.append("Accounts loaded: " + ", ".join(sorted(users)))
         for name, rec in users.items():
+            strong = str(rec.get("password_hash", "")).strip()
             h = str(rec.get("password_sha256", "")).strip()
             if name != name.strip().lower():
                 notes.append(f"'{name}' has capitals or spaces; sign-in lowercases the name")
-            if len(h) != 64:
-                notes.append(f"'{name}' hash is {len(h)} characters, expected 64")
+            if strong:
+                if not strong.startswith("$2"):
+                    notes.append(f"'{name}' password_hash is not a bcrypt hash")
+            elif len(h) != 64:
+                notes.append(f"'{name}' has no password_hash and its password_sha256 is "
+                             f"{len(h)} characters, expected 64")
             if rec.get("role") not in CHECKLIST:
                 notes.append(f"'{name}' role {rec.get('role')!r} is not one the app knows")
     else:
@@ -203,15 +219,39 @@ def secrets_report() -> list[str]:
     return notes
 
 
+MAX_ATTEMPTS = 5
+LOCKOUT_SECONDS = 60
+IDLE_MINUTES = 240
+
+
+def prehash(password: str) -> bytes:
+    """bcrypt ignores anything past 72 bytes, so hash to a fixed length first."""
+    return base64.b64encode(hashlib.sha256(password.encode()).digest())
+
+
+def verify_password(password: str, rec: dict) -> bool:
+    """Prefer the slow bcrypt hash; fall back to the older SHA-256 entries."""
+    strong = str(rec.get("password_hash", "")).strip()
+    if strong:
+        try:
+            import bcrypt
+        except ModuleNotFoundError:
+            st.error("This account uses password_hash, which needs the bcrypt package.")
+            return False
+        try:
+            return bcrypt.checkpw(prehash(password), strong.encode())
+        except ValueError:
+            st.error("password_hash in secrets is not a valid bcrypt hash.")
+            return False
+    legacy = str(rec.get("password_sha256", "")).strip()
+    return bool(legacy) and hashlib.sha256(password.encode()).hexdigest() == legacy
+
+
 def check_login(username: str, password: str) -> str | None:
     users = configured_users()
     if users:
         rec = users.get(username)
-        if rec and hashlib.sha256(password.encode()).hexdigest() == str(
-            rec.get("password_sha256", "")
-        ).strip():
-            return rec.get("role")
-        return None
+        return rec.get("role") if rec and verify_password(password, rec) else None
     demo = DEMO_USERS.get(username)
     return demo[1] if demo and demo[0] == password else None
 
@@ -222,16 +262,33 @@ def login_screen() -> None:
         '<p class="note">Sign in to plan departments, volunteers and shifts.</p>',
         unsafe_allow_html=True,
     )
+    locked_until = st.session_state.get("locked_until", 0.0)
+    waiting = int(locked_until - datetime.now().timestamp())
+    if waiting > 0:
+        st.error(f"Too many attempts. Try again in {waiting} seconds.")
+
     with st.form("login"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
-        if st.form_submit_button("Sign in", type="primary"):
+        if st.form_submit_button("Sign in", type="primary", disabled=waiting > 0):
             found = check_login(username.strip().lower(), password)
             if found:
                 st.session_state.role = found
+                st.session_state.username = username.strip().lower()
+                st.session_state.last_seen = datetime.now().timestamp()
+                st.session_state.attempts = 0
                 st.rerun()
             else:
-                st.error("That username and password don't match.")
+                st.session_state.attempts = st.session_state.get("attempts", 0) + 1
+                left = MAX_ATTEMPTS - st.session_state.attempts
+                if left <= 0:
+                    st.session_state.locked_until = (
+                        datetime.now().timestamp() + LOCKOUT_SECONDS
+                    )
+                    st.session_state.attempts = 0
+                    st.rerun()
+                st.error(f"That username and password don't match. {left} attempts left.")
+
     if not configured_users():
         st.info("No credentials in secrets, so demo logins are active (overseer / pass123).")
     with st.expander("Trouble signing in?"):
@@ -241,11 +298,23 @@ def login_screen() -> None:
 
 if "role" not in st.session_state:
     st.session_state.role = None
+
+if st.session_state.role is not None:
+    idle = datetime.now().timestamp() - st.session_state.get("last_seen", 0)
+    if idle > IDLE_MINUTES * 60:
+        st.session_state.role = None
+        st.session_state.timed_out = True
+    else:
+        st.session_state.last_seen = datetime.now().timestamp()
+
 if st.session_state.role is None:
+    if st.session_state.pop("timed_out", False):
+        st.info(f"Signed out after {IDLE_MINUTES // 60} hours without activity.")
     login_screen()
     st.stop()
 
 role: str = st.session_state.role
+actor: str = st.session_state.get("username", "")
 
 # ---------------------------------------------------------------------------
 # Choosing a gathering
@@ -289,9 +358,9 @@ with st.sidebar:
             if store.event_exists(DB, new_key):
                 st.error(f"{new_key} already exists.")
             else:
-                store.create_event(DB, new_key, new_date)
+                store.create_event(DB, new_key, new_date, actor=actor)
                 if source != "Start empty":
-                    counts = store.copy_forward(DB, source, new_key)
+                    counts = store.copy_forward(DB, source, new_key, actor=actor)
                     st.success(
                         f"{new_key} created with {counts['volunteers']} people carried "
                         "forward, all set back to Invited."
@@ -325,7 +394,7 @@ with st.sidebar:
     new_date2 = st.date_input("Gathering date", value=event_date, key=f"date_{event_key}")
     new_venue = st.text_input("Venue", value=event.get("venue") or "", key=f"venue_{event_key}")
     if new_date2 != event_date or new_venue != (event.get("venue") or ""):
-        store.save_event(DB, event_key, new_date2, new_venue, event["checklist"])
+        store.save_event(DB, event_key, new_date2, new_venue, event["checklist"], actor=actor)
         st.rerun()
     st.divider()
     st.caption(DB.label)
@@ -359,7 +428,7 @@ def save_volunteers(df: pd.DataFrame) -> None:
         {DB_FIELDS[c]: str(r.get(c, "") or "") for c in VOLUNTEER_COLUMNS}
         for r in df.fillna("").to_dict("records")
     ]
-    store.save_volunteers(DB, event_key, rows)
+    store.save_volunteers(DB, event_key, rows, actor=actor)
 
 
 def shifts_df() -> pd.DataFrame:
@@ -506,7 +575,7 @@ with tab_overview:
                 saved[key] = value
                 changed = True
         if changed:
-            store.save_event(DB, event_key, event_date, event.get("venue") or "", saved)
+            store.save_event(DB, event_key, event_date, event.get("venue") or "", saved, actor=actor)
             st.rerun()
 
     with right:
@@ -620,6 +689,7 @@ with tab_depts:
                     "hazard_done": hazard,
                     "notes": notes,
                 },
+                actor=actor,
             )
             st.rerun()
 
@@ -656,7 +726,7 @@ with tab_depts:
         if t["Department"] == dept
     ]
     if sorted([t for t in new_targets if any(v for k, v in t.items() if k != "Shift")], key=str) != sorted(current, key=str):
-        store.save_dept_targets(DB, event_key, dept, new_targets)
+        store.save_dept_targets(DB, event_key, dept, new_targets, actor=actor)
         st.rerun()
 
     st.markdown("#### Volunteers in this department")
@@ -703,13 +773,113 @@ with tab_vols:
         )
         new_shifts = shift_edit.fillna("").to_dict("records")
         if new_shifts != shift_rows:
-            store.save_shifts(DB, event_key, new_shifts)
+            old_names = [str(s["Shift"]).strip() for s in shift_rows]
+            new_names = [str(s.get("Shift", "")).strip() for s in new_shifts]
+            notes = []
+            for i in range(min(len(old_names), len(new_names))):
+                old, new = old_names[i], new_names[i]
+                if old and new and old != new and old not in new_names and new not in old_names:
+                    moved = store.rename_shift(DB, event_key, old, new, actor=actor)
+                    notes.append(f"{old} became {new}, {moved} volunteers moved with it")
+            store.save_shifts(DB, event_key, new_shifts, actor=actor)
+            for n in notes:
+                st.session_state.setdefault("flash", []).append(n)
             st.rerun()
+
+    for note in st.session_state.pop("flash", []):
+        st.success(note)
+
+    stranded = store.stranded_shifts(DB, event_key)
+    if stranded:
+        st.warning(
+            "On a shift that no longer exists: "
+            + ", ".join(f"{s['n']} in {s['shift']}" for s in stranded)
+            + ". Add that shift back, or reassign them below."
+        )
+
+    with st.expander("Paste a list of names"):
+        st.markdown(
+            '<p class="note">One name per line. They go in as Invited, and anyone '
+            'already on the list is skipped.</p>',
+            unsafe_allow_html=True,
+        )
+        p1, p2, p3 = st.columns(3)
+        paste_dept = p1.selectbox("Into department", ALL_DEPTS, key="paste_dept")
+        paste_shift = p2.selectbox("On shift", shift_names(), key="paste_shift")
+        paste_cong = p3.text_input("Congregation", key="paste_cong")
+        pasted = st.text_area("Names", height=120, key="paste_names")
+        if st.button("Add these names") and pasted.strip():
+            n = store.add_names(
+                DB,
+                event_key,
+                pasted.splitlines(),
+                paste_dept,
+                paste_shift,
+                paste_cong.strip(),
+                actor=actor,
+            )
+            st.session_state.setdefault("flash", []).append(
+                f"{n} added to {paste_dept}, {paste_shift}."
+            )
+            st.rerun()
+
+    previous = store.served_before(DB, event_key)
+    if previous:
+        with st.expander(f"Served before but not on this list ({len(previous)})"):
+            st.markdown(
+                '<p class="note">People from earlier gatherings. Adding them here '
+                'keeps their history rather than creating a second record.</p>',
+                unsafe_allow_html=True,
+            )
+            look = {
+                f"{p['name']}{' — ' + p['congregation'] if p['congregation'] else ''}"
+                f" ({p['times']}×)": p["id"]
+                for p in previous
+            }
+            picked = st.multiselect("Who to add", list(look), key="prev_pick")
+            b1, b2 = st.columns(2)
+            back_dept = b1.selectbox("Department", ALL_DEPTS, key="prev_dept")
+            back_shift = b2.selectbox("Shift", shift_names(), key="prev_shift")
+            if st.button("Add to this gathering", disabled=not picked):
+                for label in picked:
+                    store.add_person_to_event(
+                        DB, event_key, look[label], back_dept, back_shift, actor=actor
+                    )
+                store.log(
+                    DB,
+                    actor,
+                    event_key,
+                    "volunteers",
+                    f"{len(picked)} returning volunteers added to {back_dept}",
+                )
+                st.rerun()
+
+    removed_rows = store.load_removed(DB, event_key)
+    if removed_rows:
+        with st.expander(f"Recently removed ({len(removed_rows)})"):
+            st.markdown(
+                '<p class="note">Nothing is deleted outright. Put anyone back if a '
+                'row went by mistake.</p>',
+                unsafe_allow_html=True,
+            )
+            for r in removed_rows[:15]:
+                c1, c2 = st.columns([4, 1])
+                c1.markdown(
+                    f'<div class="row"><span><span class="name">{r["name"]}</span>'
+                    f'<span class="owner">{r["dept"] or "no department"}'
+                    f'{", " + r["shift"] if r["shift"] else ""}</span></span>'
+                    f'<span class="state">{(r["removed_at"] or "")[:16].replace("T", " ")}'
+                    "</span></div>",
+                    unsafe_allow_html=True,
+                )
+                if c2.button("Restore", key=f"restore_{r['id']}"):
+                    store.restore_assignment(DB, r["id"], event_key, actor=actor)
+                    st.rerun()
 
     st.markdown("#### Master volunteer list")
     base = volunteers_df()
     f1, f2, f3, f4 = st.columns([2, 2, 1.5, 1.5])
-    search = f1.text_input("Find by name", key=f"f_name_{event_key}")
+    search = f1.text_input("Find by name or congregation", key=f"f_name_{event_key}")
     f_dept = f2.multiselect("Department", ALL_DEPTS, key=f"f_dept_{event_key}")
     f_shift = f3.multiselect("Shift", shift_names(), key=f"f_shift_{event_key}")
     f_status = f4.multiselect("Status", VOLUNTEER_STATUSES, key=f"f_status_{event_key}")
@@ -719,7 +889,10 @@ with tab_vols:
     if filtering and not base.empty:
         mask = pd.Series(True, index=base.index)
         if search.strip():
-            mask &= base["Name"].str.contains(search.strip(), case=False, na=False)
+            term = search.strip()
+            mask &= base["Name"].str.contains(term, case=False, na=False) | base[
+                "Congregation"
+            ].str.contains(term, case=False, na=False)
         if f_dept:
             mask &= base["Department"].isin(f_dept)
         if f_shift:
@@ -739,6 +912,7 @@ with tab_vols:
             "Name": st.column_config.TextColumn(required=True, width="medium"),
             "Gender": st.column_config.SelectboxColumn(options=GENDERS, width="small"),
             "Privilege": st.column_config.SelectboxColumn(options=PRIVILEGES, width="small"),
+            "Congregation": st.column_config.TextColumn(width="medium"),
             "Department": st.column_config.SelectboxColumn(options=ALL_DEPTS, width="medium"),
             "Shift": st.column_config.SelectboxColumn(options=shift_names(), width="small"),
             "Status": st.column_config.SelectboxColumn(options=VOLUNTEER_STATUSES, width="small"),
@@ -880,14 +1054,15 @@ def master_list_html(frame: pd.DataFrame, include_empty: bool = False) -> str:
         if rows.empty and not include_empty:
             continue
         body = "".join(
-            f"<tr><td class='num'>{i}</td><td>{r['Name']}</td><td>{r['Gender']}</td>"
-            f"<td>{r['Privilege']}</td><td>{r['Shift']}</td><td>{r['Status']}</td></tr>"
+            f"<tr><td class='num'>{i}</td><td>{r['Name']}</td><td>{r['Congregation']}</td>"
+            f"<td>{r['Gender']}</td><td>{r['Privilege']}</td>"
+            f"<td>{r['Shift']}</td><td>{r['Status']}</td></tr>"
             for i, (_, r) in enumerate(rows.iterrows(), start=1)
-        ) or "<tr><td colspan='6'>No volunteers recorded.</td></tr>"
+        ) or "<tr><td colspan='7'>No volunteers recorded.</td></tr>"
         sections.append(
             f"<section><h2>{dept}</h2><p class='lead'>{dept_lead(dept)}</p>"
-            "<table><tr><th></th><th>Name</th><th>Gender</th><th>Privilege</th>"
-            f"<th>Shift</th><th>Status</th></tr>{body}</table>"
+            "<table><tr><th></th><th>Name</th><th>Congregation</th><th>Gender</th>"
+            f"<th>Privilege</th><th>Shift</th><th>Status</th></tr>{body}</table>"
             f"<p class='lead'>{len(rows)} volunteers</p></section>"
         )
     return f"""<!doctype html><meta charset="utf-8">
@@ -955,6 +1130,7 @@ def master_csv(frame: pd.DataFrame) -> str:
                     "Dept assistant": d.get("assistant", ""),
                     "Keymen": d.get("keymen", ""),
                     "Name": r["Name"],
+                    "Congregation": r["Congregation"],
                     "Gender": r["Gender"],
                     "Privilege": r["Privilege"],
                     "Shift": r["Shift"],
@@ -1070,6 +1246,20 @@ with tab_docs:
             st.error(f"Sheets rejected the update: {exc}")
 
     st.divider()
+    with st.expander("Who changed what"):
+        entries = store.recent_changes(DB, event_key, 50)
+        if not entries:
+            st.markdown('<p class="note">Nothing recorded yet.</p>', unsafe_allow_html=True)
+        else:
+            st.dataframe(
+                pd.DataFrame(entries).rename(
+                    columns={"ts": "When", "actor": "Who", "area": "Area", "detail": "What"}
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+
+    st.divider()
     with st.expander("Delete this gathering"):
         st.markdown(
             f'<p class="note">This gathering holds {len(named)} names. Records are '
@@ -1079,6 +1269,6 @@ with tab_docs:
         )
         sure = st.checkbox(f"Yes, delete {event_key} and everyone in it", key="del_sure")
         if st.button("Delete now", disabled=not sure):
-            store.delete_event(DB, event_key)
+            store.delete_event(DB, event_key, actor=actor)
             st.session_state.event_key = None
             st.rerun()
