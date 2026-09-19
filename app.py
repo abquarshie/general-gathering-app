@@ -510,6 +510,49 @@ with st.sidebar:
         st.rerun()
     st.divider()
     st.caption(DB.label)
+
+    with st.expander("Check the setup"):
+        st.markdown(
+            '<p class="note">Runs the same checks as check_setup.py, against what '
+            'this app can actually see.</p>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Run checks", key="run_checks"):
+            try:
+                import check_setup
+
+                results = check_setup.run_all(all_secrets())
+            except ModuleNotFoundError:
+                results = [("Setup", "fail", "check_setup.py is not next to app.py.")]
+            except Exception as exc:  # noqa: BLE001
+                results = [("Setup", "fail", f"The checks stopped: {exc}")]
+
+            st.session_state["check_results"] = results
+            st.session_state["check_where"] = (
+                f"{len(all_secrets())} blocks visible: "
+                + (", ".join(sorted(all_secrets())) or "none")
+            )
+
+        if st.session_state.get("check_results"):
+            st.markdown(
+                f'<p class="note">{st.session_state["check_where"]}</p>',
+                unsafe_allow_html=True,
+            )
+            icon = {"ok": "✓", "fail": "✗", "warn": "!"}
+            last = None
+            for section, status, message in st.session_state["check_results"]:
+                if section != last:
+                    st.markdown(f"**{section}**")
+                    last = section
+                colour = {"ok": "var(--done-ok)", "fail": "var(--signal)"}.get(
+                    status, "var(--ink-soft)"
+                )
+                st.markdown(
+                    f'<p class="note" style="margin:.1rem 0"><span style="color:{colour};'
+                    f'font-weight:700">{icon[status]}</span> {message}</p>',
+                    unsafe_allow_html=True,
+                )
+
     if DB.kind != "postgres":
         with st.expander("Move to Neon Postgres"):
             st.markdown(
