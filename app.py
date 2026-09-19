@@ -36,6 +36,25 @@ DEFAULT_SHIFTS = [
 ]
 TIME_PATTERN = r"^([01][0-9]|2[0-3]):[0-5][0-9]$"
 
+CONGREGATIONS = [
+    "Adabraka Ga",
+    "Bubiashie South Ga",
+    "Central Guggisberg Ga",
+    "Chemu Road Ga",
+    "Chorkor Ga",
+    "Chorkor North Ga",
+    "Dansoman Beach Ga",
+    "Dansoman Estate Ga",
+    "East Guggisberg Ga",
+    "Kaneshie Ga",
+    "Lartebiokoshie Ga",
+    "Lartebiokoshie West Ga",
+    "Manponse Ga",
+    "Mataheko Ga",
+    "Palace Street",
+    "Ussher Town Ga",
+]
+
 GENDERS = ["Male", "Female"]
 PRIVILEGES = ["Elder", "Servant", "Publisher"]
 VOLUNTEER_STATUSES = ["Confirmed", "Invited", "Unavailable", "Moved out"]
@@ -431,6 +450,13 @@ def save_volunteers(df: pd.DataFrame) -> None:
     store.save_volunteers(DB, event_key, rows, actor=actor)
 
 
+def congregation_options() -> list[str]:
+    """The standing list, plus any spelling already in the data."""
+    seen = {str(r.get("congregation") or "").strip() for r in vol_rows}
+    extra = sorted(c for c in seen if c and c not in CONGREGATIONS)
+    return CONGREGATIONS + extra
+
+
 def shifts_df() -> pd.DataFrame:
     return pd.DataFrame(shift_rows, columns=SHIFT_COLUMNS).astype(str)
 
@@ -806,7 +832,12 @@ with tab_vols:
         p1, p2, p3 = st.columns(3)
         paste_dept = p1.selectbox("Into department", ALL_DEPTS, key="paste_dept")
         paste_shift = p2.selectbox("On shift", shift_names(), key="paste_shift")
-        paste_cong = p3.text_input("Congregation", key="paste_cong")
+        paste_cong = p3.selectbox(
+            "Congregation",
+            [""] + congregation_options(),
+            help="Used for any line that does not name one after a comma",
+            key="paste_cong",
+        )
         pasted = st.text_area("Names", height=120, key="paste_names")
         if st.button("Add these names") and pasted.strip():
             n = store.add_names(
@@ -878,13 +909,14 @@ with tab_vols:
 
     st.markdown("#### Master volunteer list")
     base = volunteers_df()
-    f1, f2, f3, f4 = st.columns([2, 2, 1.5, 1.5])
-    search = f1.text_input("Find by name or congregation", key=f"f_name_{event_key}")
-    f_dept = f2.multiselect("Department", ALL_DEPTS, key=f"f_dept_{event_key}")
-    f_shift = f3.multiselect("Shift", shift_names(), key=f"f_shift_{event_key}")
-    f_status = f4.multiselect("Status", VOLUNTEER_STATUSES, key=f"f_status_{event_key}")
+    f1, f2, f3, f4, f5 = st.columns([2, 2, 2, 1.5, 1.5])
+    search = f1.text_input("Find by name", key=f"f_name_{event_key}")
+    f_cong = f2.multiselect("Congregation", congregation_options(), key=f"f_cong_{event_key}")
+    f_dept = f3.multiselect("Department", ALL_DEPTS, key=f"f_dept_{event_key}")
+    f_shift = f4.multiselect("Shift", shift_names(), key=f"f_shift_{event_key}")
+    f_status = f5.multiselect("Status", VOLUNTEER_STATUSES, key=f"f_status_{event_key}")
 
-    filtering = bool(search.strip() or f_dept or f_shift or f_status)
+    filtering = bool(search.strip() or f_cong or f_dept or f_shift or f_status)
     view = base
     if filtering and not base.empty:
         mask = pd.Series(True, index=base.index)
@@ -893,6 +925,8 @@ with tab_vols:
             mask &= base["Name"].str.contains(term, case=False, na=False) | base[
                 "Congregation"
             ].str.contains(term, case=False, na=False)
+        if f_cong:
+            mask &= base["Congregation"].isin(f_cong)
         if f_dept:
             mask &= base["Department"].isin(f_dept)
         if f_shift:
@@ -912,7 +946,9 @@ with tab_vols:
             "Name": st.column_config.TextColumn(required=True, width="medium"),
             "Gender": st.column_config.SelectboxColumn(options=GENDERS, width="small"),
             "Privilege": st.column_config.SelectboxColumn(options=PRIVILEGES, width="small"),
-            "Congregation": st.column_config.TextColumn(width="medium"),
+            "Congregation": st.column_config.SelectboxColumn(
+                options=congregation_options(), width="medium"
+            ),
             "Department": st.column_config.SelectboxColumn(options=ALL_DEPTS, width="medium"),
             "Shift": st.column_config.SelectboxColumn(options=shift_names(), width="small"),
             "Status": st.column_config.SelectboxColumn(options=VOLUNTEER_STATUSES, width="small"),
@@ -971,6 +1007,27 @@ with tab_vols:
             mix[g] = named[named["Gender"] == g].groupby("Department").size()
         st.markdown("#### Make-up of each department")
         st.dataframe(mix.fillna(0).astype(int), width="stretch")
+
+        with_cong = named[named["Congregation"].str.strip() != ""]
+        if not with_cong.empty:
+            spread = (
+                with_cong.pivot_table(
+                    index="Congregation", columns="Status", values="Name", aggfunc="count"
+                )
+                .fillna(0)
+                .astype(int)
+            )
+            spread["Total"] = spread.sum(axis=1)
+            st.markdown("#### Where they come from")
+            st.caption("Useful when one congregation is carrying more than its share")
+            st.dataframe(spread.sort_values("Total", ascending=False), width="stretch")
+
+            missing = len(named) - len(with_cong)
+            if missing:
+                st.markdown(
+                    f'<p class="note">{missing} volunteers have no congregation set.</p>',
+                    unsafe_allow_html=True,
+                )
 
 # ---------------------------------------------------------------------------
 # Follow-up
