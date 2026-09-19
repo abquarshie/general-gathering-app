@@ -518,6 +518,7 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
         if st.button("Run checks", key="run_checks"):
+            all_secrets.clear()  # so an edit to secrets.toml is picked up now
             try:
                 import check_setup
 
