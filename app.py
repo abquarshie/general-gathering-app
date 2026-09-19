@@ -112,6 +112,67 @@ DEPT_FIELDS = {
 
 DEMO_USERS = {"overseer": ("pass123", "Overseer"), "assistant": ("pass123", "Assistant Overseer")}
 
+NEON_STEPS = """
+1. Create a project at [console.neon.tech](https://console.neon.tech), region
+   `eu-central-1` (Frankfurt) for the best latency from Accra.
+2. Under **Roles**, create a role for the app rather than using the owner
+   account. Copy its password — it is shown once.
+3. Under **Connection Details**, pick that role and turn on **Pooled
+   connection**.
+4. Put it in `.streamlit/secrets.toml` (or App settings → Secrets on Streamlit
+   Cloud):
+
+   ```toml
+   [postgres]
+   dsn = "postgresql://user:pass@ep-xxx-pooler.eu-central-1.aws.neon.tech/neondb?sslmode=require"
+   ```
+
+5. Install the driver — the quotes are required, or zsh reads the brackets as a
+   filename pattern:
+
+   ```
+   python3 -m pip install "psycopg[binary]"
+   ```
+
+6. Restart. This sidebar should read **Neon Postgres**. Tables are created on
+   first run.
+
+**Take a backup from the Documents tab first.** Switching storage moves nothing;
+Neon starts empty and you restore into it with **Merge**.
+"""
+
+SHEETS_STEPS = """
+1. At [console.cloud.google.com](https://console.cloud.google.com), create a
+   project, then **APIs & Services → Library** and enable the **Google Sheets
+   API**.
+2. **IAM & Admin → Service Accounts → Create**. No roles or user access needed.
+3. Open it, **Keys → Add key → Create new key → JSON**, and download.
+4. Create the spreadsheet and **share it with the service account's
+   `client_email` as an Editor**. This is the step that gets forgotten — without
+   it every push fails on permissions.
+5. Copy the JSON's fields into a `[gcp_service_account]` block in secrets. Keep
+   `private_key` on one line with its `\n` sequences intact.
+6. Add the spreadsheet id — the long string in its URL between `/d/` and
+   `/edit`:
+
+   ```toml
+   [sheets]
+   spreadsheet_id = "1AbC..."
+   ```
+
+7. `python3 -m pip install gspread`, then use **Push to Sheets** above.
+"""
+
+
+def sheets_ready() -> bool:
+    try:
+        return bool(st.secrets["sheets"]["spreadsheet_id"]) and bool(
+            st.secrets["gcp_service_account"]
+        )
+    except Exception:
+        return False
+
+
 st.set_page_config(page_title=APP_TITLE, page_icon="🗓", layout="wide")
 
 CSS = """
@@ -419,6 +480,15 @@ with st.sidebar:
         st.rerun()
     st.divider()
     st.caption(DB.label)
+    if DB.kind != "postgres":
+        with st.expander("Move to Neon Postgres"):
+            st.markdown(
+                '<p class="note">A file-backed database is fine on one laptop. '
+                'Deployed, it is wiped on every redeploy and two people editing it '
+                'overwrite each other.</p>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(NEON_STEPS)
     if st.button("Sign out"):
         st.session_state.role = None
         st.rerun()
@@ -1272,6 +1342,10 @@ with tab_docs:
         'never reads back from Sheets.</p>',
         unsafe_allow_html=True,
     )
+
+    if not sheets_ready():
+        with st.expander("How to set Sheets up"):
+            st.markdown(SHEETS_STEPS)
 
     last_push = store.get_meta(DB, "last_sheets_push")
     if last_push:

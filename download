@@ -1,3 +1,7 @@
 .streamlit/secrets.toml
 data/
+*.json
+*.csv
+*.html
 __pycache__/
+.DS_Store
