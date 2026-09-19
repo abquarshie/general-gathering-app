@@ -164,13 +164,24 @@ SHEETS_STEPS = """
 """
 
 
+def sheets_problems() -> list[str]:
+    """What is still missing before Push to Sheets can work."""
+    missing = []
+    creds = secret_block("gcp_service_account")
+    sheets = secret_block("sheets")
+    if not creds:
+        missing.append("no [gcp_service_account] block in secrets")
+    else:
+        for field in ("client_email", "private_key", "project_id"):
+            if not str(creds.get(field, "")).strip():
+                missing.append(f"[gcp_service_account] has no {field}")
+    if not str(sheets.get("spreadsheet_id", "")).strip():
+        missing.append("no spreadsheet_id under [sheets]")
+    return missing
+
+
 def sheets_ready() -> bool:
-    try:
-        return bool(st.secrets["sheets"]["spreadsheet_id"]) and bool(
-            st.secrets["gcp_service_account"]
-        )
-    except Exception:
-        return False
+    return not sheets_problems()
 
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🗓", layout="wide")
@@ -223,13 +234,45 @@ st.markdown(CSS, unsafe_allow_html=True)
 # ---------------------------------------------------------------------------
 
 
+def local_secrets_path() -> Path:
+    return Path(__file__).parent / ".streamlit" / "secrets.toml"
+
+
+@st.cache_resource
+def all_secrets() -> dict:
+    """Every secret, from either place Streamlit might not be looking.
+
+    Streamlit only reads .streamlit/secrets.toml relative to the folder it was
+    started from. Running `streamlit run ~/somewhere/app.py` from home means it
+    sees nothing, and the app would quietly fall back to SQLite and report
+    Sheets as unconfigured while the file sat right next to app.py.
+    """
+    merged: dict = {}
+    local = local_secrets_path()
+    if local.exists():
+        try:
+            import tomllib
+
+            merged.update(tomllib.loads(local.read_text()))
+        except Exception:
+            pass
+    try:
+        for key in st.secrets.keys():
+            value = st.secrets[key]
+            merged[key] = dict(value) if hasattr(value, "keys") else value
+    except Exception:
+        pass
+    return merged
+
+
+def secret_block(name: str) -> dict:
+    block = all_secrets().get(name)
+    return dict(block) if hasattr(block, "keys") else {}
+
+
 @st.cache_resource
 def get_db() -> store.Database:
-    try:
-        secrets = st.secrets
-    except Exception:
-        secrets = None
-    return store.Database(secrets)
+    return store.Database(all_secrets())
 
 
 try:
@@ -248,21 +291,8 @@ except Exception as exc:  # noqa: BLE001
 
 
 def configured_users() -> dict | None:
-    try:
-        users = dict(st.secrets["users"])
-        if users:
-            return users
-    except Exception:
-        pass
-    local = Path(__file__).parent / ".streamlit" / "secrets.toml"
-    if local.exists():
-        try:
-            import tomllib
-
-            return dict(tomllib.loads(local.read_text()).get("users") or {}) or None
-        except Exception:
-            return None
-    return None
+    users = secret_block("users")
+    return {k: dict(v) if hasattr(v, "keys") else v for k, v in users.items()} or None
 
 
 def secrets_report() -> list[str]:
@@ -1343,7 +1373,19 @@ with tab_docs:
         unsafe_allow_html=True,
     )
 
-    if not sheets_ready():
+    gaps = sheets_problems()
+    if gaps:
+        st.markdown(
+            '<p class="note">Not ready yet: ' + "; ".join(gaps) + ".</p>",
+            unsafe_allow_html=True,
+        )
+        if not local_secrets_path().exists():
+            st.markdown(
+                f'<p class="note">No secrets file at {local_secrets_path()} either. '
+                "If yours lives elsewhere, Streamlit only reads the one in the folder "
+                "you launched it from.</p>",
+                unsafe_allow_html=True,
+            )
         with st.expander("How to set Sheets up"):
             st.markdown(SHEETS_STEPS)
 
@@ -1361,12 +1403,12 @@ with tab_docs:
             '<p class="note">Never pushed.</p>', unsafe_allow_html=True
         )
 
-    if st.button("Push to Sheets"):
+    if st.button("Push to Sheets", disabled=not sheets_ready()):
         try:
             import gspread
 
-            creds = dict(st.secrets["gcp_service_account"])
-            sheet_id = str(st.secrets["sheets"]["spreadsheet_id"])
+            creds = secret_block("gcp_service_account")
+            sheet_id = str(secret_block("sheets").get("spreadsheet_id", ""))
             client = gspread.service_account_from_dict(creds)
             book = client.open_by_key(sheet_id)
 
@@ -1393,12 +1435,8 @@ with tab_docs:
             store.set_meta(DB, "last_sheets_push", str(len(pages)))
             store.log(DB, actor, event_key, "backup", f"{len(pages)} sheets pushed")
             st.success(f"{len(pages)} sheets updated.")
-        except KeyError:
-            st.error(
-                "Sheets is not configured. Add a [gcp_service_account] block and "
-                "[sheets] spreadsheet_id to secrets, and share the sheet with the "
-                "service account address."
-            )
+        except KeyError as exc:
+            st.error(f"Sheets configuration is incomplete: {exc}")
         except ModuleNotFoundError:
             st.error("gspread is not installed. Add gspread to requirements.txt.")
         except Exception as exc:  # noqa: BLE001
