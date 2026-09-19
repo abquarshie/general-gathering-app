@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
+import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -1265,10 +1267,26 @@ with tab_docs:
     st.divider()
     st.markdown("#### Mirror to Google Sheets")
     st.markdown(
-        '<p class="note">Writes both lists to a spreadsheet so they can be read '
-        'without the app. One-way: the app never reads back from Sheets.</p>',
+        '<p class="note">Writes both documents plus a copy of every table, so the '
+        'data can be read — and recovered — without the app. One way only: the app '
+        'never reads back from Sheets.</p>',
         unsafe_allow_html=True,
     )
+
+    last_push = store.get_meta(DB, "last_sheets_push")
+    if last_push:
+        st.markdown(
+            f'<p class="note">Last pushed {last_push["at"].replace("T", " ")[:16]}.</p>',
+            unsafe_allow_html=True,
+        )
+        stale = (datetime.now() - datetime.fromisoformat(last_push["at"])).days
+        if stale >= 7:
+            st.warning(f"The Sheets copy is {stale} days old.")
+    else:
+        st.markdown(
+            '<p class="note">Never pushed.</p>', unsafe_allow_html=True
+        )
+
     if st.button("Push to Sheets"):
         try:
             import gspread
@@ -1278,19 +1296,29 @@ with tab_docs:
             client = gspread.service_account_from_dict(creds)
             book = client.open_by_key(sheet_id)
 
-            master_rows = pd.read_csv(pd.io.common.StringIO(master_csv(frame))).fillna("")
-            rot_rows = pd.read_csv(pd.io.common.StringIO(rotation_csv(frame))).fillna("")
-            for title, table in (
+            master_rows = pd.read_csv(io.StringIO(master_csv(frame))).fillna("")
+            rot_rows = pd.read_csv(io.StringIO(rotation_csv(frame))).fillna("")
+            pages = [
                 (f"{event_key} master", master_rows),
                 (f"{event_key} rotation", rot_rows),
-            ):
+            ]
+            dump = store.export_all(DB)
+            for table, rows in dump["tables"].items():
+                pages.append((f"data {table}", pd.DataFrame(rows).fillna("")))
+
+            for title, table in pages:
                 try:
                     sheet = book.worksheet(title)
                     sheet.clear()
                 except Exception:
-                    sheet = book.add_worksheet(title, rows=200, cols=20)
+                    sheet = book.add_worksheet(title, rows=400, cols=26)
+                if table.empty:
+                    continue
                 sheet.update([table.columns.tolist()] + table.astype(str).values.tolist())
-            st.success("Both sheets updated.")
+
+            store.set_meta(DB, "last_sheets_push", str(len(pages)))
+            store.log(DB, actor, event_key, "backup", f"{len(pages)} sheets pushed")
+            st.success(f"{len(pages)} sheets updated.")
         except KeyError:
             st.error(
                 "Sheets is not configured. Add a [gcp_service_account] block and "
@@ -1301,6 +1329,85 @@ with tab_docs:
             st.error("gspread is not installed. Add gspread to requirements.txt.")
         except Exception as exc:  # noqa: BLE001
             st.error(f"Sheets rejected the update: {exc}")
+
+    st.divider()
+    st.markdown("#### Backup file")
+    last_dl = store.get_meta(DB, "last_backup")
+    st.markdown(
+        '<p class="note">Everything in the database — every gathering, not just this '
+        'one. The file name carries the date and time, so downloads pile up as a '
+        'history instead of overwriting each other.'
+        + (f' Last taken {last_dl["at"].replace("T", " ")[:16]}.' if last_dl else "")
+        + "</p>",
+        unsafe_allow_html=True,
+    )
+
+    dump = store.export_all(DB)
+    facts = store.describe_backup(dump)
+    st.markdown(
+        f'<p class="note">{facts["people"]} people across '
+        f'{len(facts["gatherings"])} '
+        f'{"gathering" if len(facts["gatherings"]) == 1 else "gatherings"}.</p>',
+        unsafe_allow_html=True,
+    )
+    if st.download_button(
+        "Download backup (JSON)",
+        json.dumps(dump, indent=1),
+        file_name=f"gathering_backup_{datetime.now():%Y%m%d_%H%M}.json",
+        mime="application/json",
+    ):
+        store.set_meta(DB, "last_backup", facts["exported_at"])
+
+    with st.expander("Restore from a backup file"):
+        uploaded = st.file_uploader("Backup file", type="json", key="restore_file")
+        if uploaded is not None:
+            try:
+                incoming = json.load(uploaded)
+                summary = store.describe_backup(incoming)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"That file could not be read as a backup: {exc}")
+                summary = None
+
+            if summary:
+                st.markdown(
+                    f'<p class="note">Taken {summary["exported_at"].replace("T", " ")[:16]}, '
+                    f'holding {summary["people"]} people.</p>',
+                    unsafe_allow_html=True,
+                )
+                if summary["gatherings"]:
+                    st.dataframe(
+                        pd.DataFrame(summary["gatherings"]), hide_index=True, width="stretch"
+                    )
+                mode = st.radio(
+                    "How to apply it",
+                    ["Merge", "Replace everything"],
+                    horizontal=True,
+                    key="restore_mode",
+                    help=(
+                        "Merge adds what is missing and leaves anything already here "
+                        "alone. Replace empties the database first, so it ends up "
+                        "matching the file exactly."
+                    ),
+                )
+                danger = mode == "Replace everything"
+                agreed = st.checkbox(
+                    "Yes, wipe the current data first" if danger else "Go ahead and merge",
+                    key="restore_ok",
+                )
+                if st.button("Restore", disabled=not agreed, type="primary"):
+                    try:
+                        counts = store.restore_all(
+                            DB,
+                            incoming,
+                            "replace" if danger else "merge",
+                            actor=actor,
+                        )
+                        written = ", ".join(f"{v} {k}" for k, v in counts.items() if v)
+                        st.success(f"Restored: {written or 'nothing new to add'}.")
+                        st.session_state.event_key = None
+                        st.rerun()
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Restore stopped, nothing was written: {exc}")
 
     st.divider()
     with st.expander("Who changed what"):

@@ -821,3 +821,136 @@ def copy_forward(db: Database, source: str, target: str, actor: str = "", reset_
         f"copied from {source}: {counts['volunteers']} people, {counts['departments']} departments",
     )
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Backup and restore
+# ---------------------------------------------------------------------------
+
+TABLES = {
+    "events": ("event_key",),
+    "departments": ("event_key", "dept"),
+    "shifts": ("event_key", "shift"),
+    "targets": ("event_key", "dept", "shift"),
+    "people": ("id",),
+    "assignments": ("id",),
+    "changes": ("id",),
+}
+
+
+def _ensure_meta(db: Database) -> None:
+    db.run(
+        "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, at TEXT)"
+    )
+
+
+def set_meta(db: Database, key: str, value: str = "") -> None:
+    _ensure_meta(db)
+    db.run(
+        "INSERT INTO meta (k, v, at) VALUES (?, ?, ?) "
+        "ON CONFLICT (k) DO UPDATE SET v = excluded.v, at = excluded.at",
+        (key, value, datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def get_meta(db: Database, key: str) -> dict:
+    _ensure_meta(db)
+    rows = db.rows("SELECT k, v, at FROM meta WHERE k = ?", (key,))
+    return rows[0] if rows else {}
+
+
+def export_all(db: Database) -> dict:
+    """Everything in the database, as plain JSON-safe rows."""
+    out = {
+        "format": 1,
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "source": "postgres" if db.kind == "postgres" else "sqlite",
+        "tables": {},
+    }
+    for table in TABLES:
+        rows = db.rows(f"SELECT * FROM {table}")
+        out["tables"][table] = [
+            {k: (v if v is None else str(v)) for k, v in row.items()} for row in rows
+        ]
+    return out
+
+
+def describe_backup(data: dict) -> dict:
+    """What a backup file holds, for showing before anything is written."""
+    tables = data.get("tables", {})
+    people = {p["id"]: p for p in tables.get("people", [])}
+    gatherings = []
+    for ev in tables.get("events", []):
+        key = ev.get("event_key")
+        live = [
+            a
+            for a in tables.get("assignments", [])
+            if a.get("event_key") == key and not a.get("removed_at")
+        ]
+        gatherings.append(
+            {
+                "Gathering": key,
+                "Date": ev.get("event_date"),
+                "Venue": ev.get("venue") or "",
+                "Volunteers": len(live),
+                "Departments": sum(
+                    1 for d in tables.get("departments", []) if d.get("event_key") == key
+                ),
+            }
+        )
+    return {
+        "exported_at": data.get("exported_at", "unknown"),
+        "people": len(people),
+        "gatherings": sorted(gatherings, key=lambda g: str(g["Date"]), reverse=True),
+        "counts": {t: len(rows) for t, rows in tables.items()},
+    }
+
+
+def restore_all(db: Database, data: dict, mode: str = "merge", actor: str = "") -> dict:
+    """Write a backup back into the database.
+
+    merge   — add rows that are missing, leave anything present untouched.
+    replace — empty every table first, so the database ends up matching the file.
+    """
+    if data.get("format") != 1:
+        raise ValueError("This file is not a portal backup.")
+    tables = data.get("tables", {})
+    counts = {}
+    pairs: list = []
+
+    if mode == "replace":
+        for table in reversed(list(TABLES)):
+            pairs.append((f"DELETE FROM {table}", ()))
+
+    existing = {}
+    if mode != "replace":
+        for table, pk in TABLES.items():
+            existing[table] = {
+                tuple(str(r[c]) for c in pk) for r in db.rows(f"SELECT * FROM {table}")
+            }
+
+    for table, pk in TABLES.items():
+        rows = tables.get(table) or []
+        written = 0
+        for row in rows:
+            if mode != "replace":
+                ident = tuple(str(row.get(c)) for c in pk)
+                if ident in existing.get(table, set()):
+                    continue
+            cols = list(row)
+            placeholders = ", ".join("?" for _ in cols)
+            pairs.append(
+                (
+                    f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
+                    tuple(row[c] for c in cols),
+                )
+            )
+            written += 1
+        counts[table] = written
+
+    db.run_many(pairs)
+    set_meta(db, "last_restore", mode)
+    log(db, actor, "", "backup", f"restored ({mode}): " + ", ".join(
+        f"{v} {k}" for k, v in counts.items() if v
+    ))
+    return counts
