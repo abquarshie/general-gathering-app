@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -118,6 +120,9 @@ class Database:
     def __init__(self, secrets=None):
         self.dsn = _dsn(secrets) if secrets is not None else None
         self.kind = "postgres" if self.dsn else "sqlite"
+        self._lock = threading.RLock()
+        self._live = None
+        self.queries = 0
         if self.kind == "sqlite":
             DB_FILE.parent.mkdir(parents=True, exist_ok=True)
         self.setup()
@@ -129,40 +134,75 @@ class Database:
 
     @contextmanager
     def _conn(self):
+        """One connection, kept open and reused.
+
+        Opening a connection per query is free on SQLite and expensive on Neon —
+        a TLS handshake every time. The lock is here because Streamlit shares
+        this object across sessions and threads.
+        """
+        with self._lock:
+            conn = self._live or self._open()
+            self._live = conn
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    self._drop()
+                raise
+
+    def _open(self):
         if self.kind == "postgres":
             import psycopg
 
-            conn = psycopg.connect(self.dsn)
-        else:
-            conn = sqlite3.connect(DB_FILE)
+            return psycopg.connect(self.dsn, connect_timeout=15)
+        return sqlite3.connect(DB_FILE, check_same_thread=False)
+
+    def _drop(self) -> None:
         try:
-            yield conn
-            conn.commit()
+            if self._live is not None:
+                self._live.close()
         except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+            pass
+        self._live = None
 
     def _sql(self, statement: str) -> str:
         return statement.replace("?", "%s") if self.kind == "postgres" else statement
 
+    def _attempt(self, work, retries: int = 1):
+        """Run work(cursor); reconnect once if the connection went stale."""
+        for attempt in range(retries + 1):
+            try:
+                with self._conn() as conn:
+                    return work(conn.cursor())
+            except Exception:
+                self._drop()
+                if attempt == retries:
+                    raise
+                time.sleep(0.2)
+
     def run(self, statement: str, params: tuple = ()) -> None:
-        with self._conn() as conn:
-            conn.cursor().execute(self._sql(statement), params)
+        self.queries += 1
+        self._attempt(lambda cur: cur.execute(self._sql(statement), params))
 
     def run_many(self, pairs: list) -> None:
-        with self._conn() as conn:
-            cur = conn.cursor()
+        def work(cur):
             for statement, params in pairs:
                 cur.execute(self._sql(statement), params)
 
+        self.queries += 1
+        self._attempt(work)
+
     def rows(self, statement: str, params: tuple = ()) -> list:
-        with self._conn() as conn:
-            cur = conn.cursor()
+        def work(cur):
             cur.execute(self._sql(statement), params)
             cols = [c[0] for c in cur.description]
             return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+        self.queries += 1
+        return self._attempt(work)
 
     def setup(self) -> None:
         with self._conn() as conn:
@@ -591,8 +631,26 @@ def add_names(
     congregation: str = "",
     actor: str = "",
 ) -> int:
-    """Add a pasted block of names to one department and shift."""
-    added = 0
+    """Add a pasted block of names to one department and shift.
+
+    Everybody is looked up once up front rather than per name, so pasting a
+    hundred names is a handful of round trips instead of a few hundred.
+    """
+    index = {
+        (str(p["name"]).strip().lower(), str(p["congregation"] or "").strip().lower()): p["id"]
+        for p in db.rows("SELECT id, name, congregation FROM people")
+    }
+    taken = {
+        r["person_id"]
+        for r in db.rows(
+            "SELECT person_id FROM assignments WHERE event_key = ? AND removed_at IS NULL", (key,)
+        )
+    }
+
+    new_people: list = []
+    new_rows: list = []
+    now = datetime.now().isoformat(timespec="seconds")
+
     for raw in lines:
         name = str(raw).strip().strip(",;")
         if not name:
@@ -601,22 +659,35 @@ def add_names(
         if "," in name:  # "Name, Congregation" on one line
             name, _, tail = name.partition(",")
             name, cong = name.strip(), tail.strip() or congregation
-        pid = ensure_person(db, {"name": name, "congregation": cong})
-        clash = db.rows(
-            "SELECT id FROM assignments WHERE event_key = ? AND person_id = ? AND removed_at IS NULL",
-            (key, pid),
-        )
-        if clash:
+
+        ident = (name.lower(), str(cong or "").strip().lower())
+        pid = index.get(ident)
+        if pid is None:
+            pid = str(uuid.uuid4())
+            index[ident] = pid
+            new_people.append(
+                (
+                    "INSERT INTO people (id, name, gender, privilege, congregation, created_at) "
+                    "VALUES (?, ?, '', '', ?, ?)",
+                    (pid, name, str(cong or "").strip(), now),
+                )
+            )
+        if pid in taken:
             continue
-        db.run(
-            "INSERT INTO assignments (id, event_key, person_id, dept, shift, status, notes) "
-            "VALUES (?, ?, ?, ?, ?, 'Invited', '')",
-            (str(uuid.uuid4()), key, pid, dept, shift),
+        taken.add(pid)
+        new_rows.append(
+            (
+                "INSERT INTO assignments (id, event_key, person_id, dept, shift, status, notes) "
+                "VALUES (?, ?, ?, ?, ?, 'Invited', '')",
+                (str(uuid.uuid4()), key, pid, dept, shift),
+            )
         )
-        added += 1
-    if added:
-        log(db, actor, key, dept, f"{added} names pasted in for {shift}")
-    return added
+
+    if new_people or new_rows:
+        db.run_many(new_people + new_rows)
+    if new_rows:
+        log(db, actor, key, dept, f"{len(new_rows)} names pasted in for {shift}")
+    return len(new_rows)
 
 
 # ---------------------------------------------------------------------------

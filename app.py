@@ -714,9 +714,11 @@ with tab_vols:
             flash(f"{n} added to {paste_dept}, {paste_shift}.")
             st.rerun()
 
-    previous = store.served_before(DB, event_key)
-    if previous:
-        with st.expander(f"Served before but not on this list ({len(previous)})"):
+    with st.expander("Served before but not on this list"):
+        if st.button("Look them up", key="prev_look"):
+            st.session_state["previous"] = store.served_before(DB, event_key)
+        previous = st.session_state.get("previous") or []
+        if previous:
             look = {
                 f"{p['name']}{' — ' + p['congregation'] if p['congregation'] else ''}"
                 f" ({p['times']}×)": p["id"]
@@ -732,6 +734,7 @@ with tab_vols:
                         DB, event_key, look[label], back_dept, back_shift, actor=actor
                     )
                 store.log(DB, actor, event_key, "volunteers", f"{len(picked)} returning added")
+                st.session_state.pop("previous", None)
                 st.rerun()
 
     removed_rows = store.load_removed(DB, event_key)
@@ -972,21 +975,28 @@ def sheets_problems() -> list[str]:
 
 with tab_settings:
     st.markdown("#### Backup")
-    dump = store.export_all(DB)
-    facts = store.describe_backup(dump)
     st.markdown(
-        f'<p class="note">Everything in the database — {facts["people"]} people across '
-        f'{len(facts["gatherings"])} '
-        f'{"gathering" if len(facts["gatherings"]) == 1 else "gatherings"}. The file '
-        "name carries the date and time, so downloads pile up as a history.</p>",
+        '<p class="note">Everything in the database, not just this gathering. The '
+        "file name carries the date and time, so downloads pile up as a history.</p>",
         unsafe_allow_html=True,
     )
-    st.download_button(
-        "Download backup (JSON)",
-        json.dumps(dump, indent=1),
-        file_name=f"gathering_backup_{datetime.now():%Y%m%d_%H%M}.json",
-        mime="application/json",
-    )
+    if st.button("Prepare backup file"):
+        st.session_state["dump"] = store.export_all(DB)
+    if st.session_state.get("dump"):
+        facts = store.describe_backup(st.session_state["dump"])
+        st.markdown(
+            f'<p class="note">{facts["people"]} people across {len(facts["gatherings"])} '
+            f'{"gathering" if len(facts["gatherings"]) == 1 else "gatherings"}, '
+            f'read {facts["exported_at"].replace("T", " ")[:16]}.</p>',
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "Download backup (JSON)",
+            json.dumps(st.session_state["dump"], indent=1),
+            file_name=f"gathering_backup_{datetime.now():%Y%m%d_%H%M}.json",
+            mime="application/json",
+            type="primary",
+        )
 
     with st.expander("Restore from a backup file"):
         uploaded = st.file_uploader("Backup file", type="json", key="restore_file")
@@ -1135,6 +1145,11 @@ with tab_settings:
                     f'font-weight:700">{icon[status]}</span> {message}</p>',
                     unsafe_allow_html=True,
                 )
+
+    st.markdown(
+        f'<p class="note">{DB.queries} database calls so far this session.</p>',
+        unsafe_allow_html=True,
+    )
 
     with st.expander("Who changed what"):
         entries = store.recent_changes(DB, event_key, 50)
