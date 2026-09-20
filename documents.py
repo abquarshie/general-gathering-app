@@ -108,7 +108,22 @@ def rotation_html(frame: pd.DataFrame, ctx: dict) -> str:
     )
 
 
-def master_csv(frame: pd.DataFrame, ctx: dict) -> str:
+MASTER_COLUMNS = [
+    "Department",
+    "Dept overseer",
+    "Dept assistant",
+    "Keymen",
+    "Name",
+    "Congregation",
+    "Gender",
+    "Privilege",
+    "Shift",
+    "Status",
+]
+
+
+def master_frame(frame: pd.DataFrame, ctx: dict) -> pd.DataFrame:
+    """The master list as one flat table. Empty still carries its headings."""
     out = []
     for dept in ctx["dept_order"]:
         d = ctx["departments"].get(dept, {})
@@ -127,12 +142,20 @@ def master_csv(frame: pd.DataFrame, ctx: dict) -> str:
                     "Status": r["Status"],
                 }
             )
-    return pd.DataFrame(out).to_csv(index=False)
+    return pd.DataFrame(out, columns=MASTER_COLUMNS)
 
 
-def rotation_csv(frame: pd.DataFrame, ctx: dict) -> str:
+def master_csv(frame: pd.DataFrame, ctx: dict) -> str:
+    return master_frame(frame, ctx).to_csv(index=False)
+
+
+def rotation_table(frame: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     out = []
     for dept in ctx["dept_order"]:
         for _, row in rotation_frame(frame, ctx, dept).iterrows():
             out.append({"Department": dept, **row.to_dict()})
-    return pd.DataFrame(out).to_csv(index=False)
+    return pd.DataFrame(out, columns=["Department"] + list(ctx["shifts"]))
+
+
+def rotation_csv(frame: pd.DataFrame, ctx: dict) -> str:
+    return rotation_table(frame, ctx).to_csv(index=False)

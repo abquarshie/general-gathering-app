@@ -10,7 +10,6 @@ Storage is Neon Postgres when configured, SQLite otherwise — see README.md.
 
 from __future__ import annotations
 
-import io
 import json
 from datetime import date, datetime, timedelta
 
@@ -1063,9 +1062,10 @@ with tab_settings:
 
             frame_all = volunteers_df()
             frame_all = frame_all[frame_all["Name"].str.strip() != ""]
+            ctx_all = doc_context()
             pages = [
-                (f"{event_key} master", pd.read_csv(io.StringIO(docs.master_csv(frame_all, doc_context())))),
-                (f"{event_key} rotation", pd.read_csv(io.StringIO(docs.rotation_csv(frame_all, doc_context())))),
+                (f"{event_key} master", docs.master_frame(frame_all, ctx_all)),
+                (f"{event_key} rotation", docs.rotation_table(frame_all, ctx_all)),
             ]
             for table_name, rows in store.export_all(DB)["tables"].items():
                 pages.append((f"data {table_name}", pd.DataFrame(rows)))
@@ -1077,8 +1077,11 @@ with tab_settings:
                     sheet.clear()
                 except Exception:
                     sheet = book.add_worksheet(title, rows=400, cols=26)
+                values = [table.columns.tolist()]
                 if not table.empty:
-                    sheet.update([table.columns.tolist()] + table.astype(str).values.tolist())
+                    values += table.astype(str).values.tolist()
+                if len(values[0]):
+                    sheet.update(values)
 
             store.set_meta(DB, "last_sheets_push", str(len(pages)))
             store.log(DB, actor, event_key, "backup", f"{len(pages)} sheets pushed")
