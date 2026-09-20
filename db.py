@@ -380,7 +380,7 @@ def create_event(db: Database, key: str, event_date: date, venue: str = "", acto
         "VALUES (?, ?, ?, ?, ?) ON CONFLICT (event_key) DO NOTHING",
         (key, event_date.isoformat(), venue, "{}", datetime.now().isoformat(timespec="seconds")),
     )
-    log(db, actor, key, "gathering", f"created for {event_date:%d %B %Y}")
+    log(db, actor, key, "assembly", f"created for {event_date:%d %B %Y}")
 
 
 def load_event(db: Database, key: str) -> dict:
@@ -421,7 +421,7 @@ def save_event(
         done = sum(1 for v in checklist.values() if v)
         bits.append(f"checklist at {done} confirmed")
     if bits:
-        log(db, actor, key, "gathering", "; ".join(bits))
+        log(db, actor, key, "assembly", "; ".join(bits))
 
 
 def delete_event(db: Database, key: str, actor: str = "") -> None:
@@ -434,7 +434,7 @@ def delete_event(db: Database, key: str, actor: str = "") -> None:
             ("DELETE FROM events WHERE event_key = ?", (key,)),
         ]
     )
-    log(db, actor, key, "gathering", "deleted, with everyone in it")
+    log(db, actor, key, "assembly", "deleted, with everyone in it")
 
 
 # ---------------------------------------------------------------------------
@@ -946,7 +946,7 @@ def copy_forward(db: Database, source: str, target: str, actor: str = "", reset_
         db,
         actor,
         target,
-        "gathering",
+        "assembly",
         f"copied from {source}: {counts['volunteers']} people, {counts['departments']} departments",
     )
     return counts

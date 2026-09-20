@@ -51,9 +51,9 @@ def _lead(ctx: dict, dept: str) -> str:
 def _header(ctx: dict, title: str, extra: str = "") -> str:
     venue = f" &middot; {ctx['venue']}" if ctx.get("venue") else ""
     return f"""<!doctype html><meta charset="utf-8">
-<title>{title} — {ctx['part']} {ctx['year']}</title><style>{PRINT_CSS}</style>
+<title>{title} — {ctx.get('part_label', ctx['part'])} {ctx['year']}</title><style>{PRINT_CSS}</style>
 <h1>{title}</h1>
-<p class="sub">General Gathering {ctx['part']}, {ctx['year']} &middot;
+<p class="sub">{ctx.get('part_label', ctx['part'])}, {ctx['year']} &middot;
 {ctx['event_date']:%A, %d %B %Y}{venue}{extra} &middot; printed {ctx['today']:%d %B %Y}</p>
 """
 
@@ -186,7 +186,7 @@ SOFT = "5B6B7C"
 def _subtitle(ctx: dict, extra: str = "") -> str:
     venue = f" · {ctx['venue']}" if ctx.get("venue") else ""
     return (
-        f"General Gathering {ctx['part']}, {ctx['year']} · "
+        f"{ctx.get('part_label', ctx['part'])}, {ctx['year']} · "
         f"{ctx['event_date']:%A, %d %B %Y}{venue}{extra} · printed {ctx['today']:%d %B %Y}"
     )
 

@@ -48,7 +48,7 @@ def _oversight(ctx: dict, dept: str) -> str:
 def _subtitle(ctx: dict, extra: str = "") -> str:
     venue = f"   ·   {ctx['venue']}" if ctx.get("venue") else ""
     return (
-        f"General Gathering {ctx['part']}, {ctx['year']}   ·   "
+        f"{ctx.get('part_label', ctx['part'])}, {ctx['year']}   ·   "
         f"{ctx['event_date']:%A, %d %B %Y}{venue}{extra}   ·   "
         f"printed {ctx['today']:%d %B %Y}"
     )
@@ -415,8 +415,8 @@ def _pdf_build(story, title: str, ctx: dict, extra: str = "") -> bytes:
     doc = BaseDocTemplate(
         buffer,
         pagesize=A4,
-        title=f"{title} — {ctx['part']} {ctx['year']}",
-        author="Gathering Portal",
+        title=f"{title} — {ctx.get('part_label', ctx['part'])} {ctx['year']}",
+        author="Assembly Portal",
     )
     chrome = _pdf_chrome(title, ctx, extra)
     doc.addPageTemplates(

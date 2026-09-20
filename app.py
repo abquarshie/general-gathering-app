@@ -1,7 +1,7 @@
 """
-General Gathering Management Portal
------------------------------------
-For the gathering overseer and the assistant overseer.
+Circuit Assembly Portal
+-----------------------
+For the assembly overseer and the assistant assembly overseer.
 
     streamlit run app.py
 
@@ -20,7 +20,18 @@ import auth
 import db as store
 import documents as docs
 
-APP_TITLE = "Gathering Portal"
+APP_TITLE = "Assembly Portal"
+
+# Stored as Part 1 / Part 2 so existing records keep working; shown as what
+# they actually are.
+PART_LABELS = {
+    "Part 1": "Circuit Assembly with the circuit overseer",
+    "Part 2": "Circuit Assembly with the branch representative",
+}
+
+
+def part_label(part_key: str) -> str:
+    return PART_LABELS.get(part_key, part_key)
 
 OVERSEER_DEPTS = ["Accounts", "Attendant", "Cleaning", "First Aid", "Parking", "Rooming"]
 ASSISTANT_DEPTS = ["Audio/Video", "Baptism", "Installation", "Lost & Found", "Checkroom"]
@@ -70,7 +81,18 @@ DB_FIELDS = {
     "Notes": "notes",
 }
 
-CHECKLIST = {
+SHARED_CHECKLIST = [
+    ("prev_adjustments", "Adjustments noted after the previous assembly will be implemented"),
+    ("staffed", "All departments are properly staffed"),
+    ("parking_plan", "The parking plan is up to date"),
+    ("cleaning_sent", "Cleaning assignments have been sent to the congregations"),
+    ("accounts_talk", "Spoken with the accounts overseer about financial matters"),
+    ("emergency_plan", "The emergency preparedness plan is up to date"),
+    ("instructions", "Latest department instructions reviewed, and overseers can reach them"),
+    ("unclaimed", "Unclaimed items from the previous assembly dispensed with"),
+]
+
+ROLE_CHECKLIST = {
     "Overseer": [
         ("setup_brief", "Department overseers told which setup work is allowed"),
         ("setup_plan", "Setup work planned and sequenced"),
@@ -86,6 +108,10 @@ CHECKLIST = {
         ("recruit_a", "Recruitment closed four weeks before the date"),
     ],
 }
+
+# Both overseers see the shared items, and a tick by one shows for the other.
+CHECKLIST = {role: items + SHARED_CHECKLIST for role, items in ROLE_CHECKLIST.items()}
+
 DEPT_FIELDS = {
     "overseer": "",
     "assistant": "",
@@ -206,7 +232,7 @@ role: str = st.session_state.role
 actor: str = st.session_state.get("username", "")
 
 # ---------------------------------------------------------------------------
-# Which gathering
+# Which assembly
 # ---------------------------------------------------------------------------
 
 events = store.list_events(DB)
@@ -222,15 +248,20 @@ with st.sidebar:
 
     if keys:
         st.session_state.event_key = st.selectbox(
-            "Gathering",
+            "Assembly",
             keys,
             index=keys.index(st.session_state.event_key),
             format_func=lambda k: labels[k],
             key="event_pick",
         )
 
-    with st.expander("Start a new gathering", expanded=not keys):
-        new_part = st.selectbox("Part", ["Part 1", "Part 2"], key="new_part")
+    with st.expander("Start a new assembly", expanded=not keys):
+        new_part = st.selectbox(
+            "Which assembly",
+            ["Part 1", "Part 2"],
+            format_func=part_label,
+            key="new_part",
+        )
         new_year = st.number_input("Year", value=datetime.now().year, step=1, key="new_year")
         new_date = st.date_input("Date", value=date.today() + timedelta(days=90), key="new_date")
         source = st.selectbox(
@@ -260,9 +291,9 @@ with st.sidebar:
         st.rerun()
 
 if not st.session_state.event_key:
-    st.markdown("### No gathering yet")
+    st.markdown("### No assembly yet")
     st.markdown(
-        '<p class="note">Create one in the sidebar. If a previous gathering exists, '
+        '<p class="note">Create one in the sidebar. If a previous assembly exists, '
         'copy it forward instead of typing everyone in again.</p>',
         unsafe_allow_html=True,
     )
@@ -301,7 +332,7 @@ event_date = date.fromisoformat(event["event_date"])
 part, year = event_key.rsplit(" ", 1)
 
 with st.sidebar:
-    new_date2 = st.date_input("Gathering date", value=event_date, key=f"date_{event_key}")
+    new_date2 = st.date_input("Assembly date", value=event_date, key=f"date_{event_key}")
     new_venue = st.text_input("Venue", value=event.get("venue") or "", key=f"venue_{event_key}")
     if new_date2 != event_date or new_venue != (event.get("venue") or ""):
         store.save_event(DB, event_key, new_date2, new_venue, event["checklist"], actor=actor)
@@ -416,6 +447,7 @@ def dept_progress(dept: str) -> tuple[int, int]:
 def doc_context() -> dict:
     return {
         "part": part,
+        "part_label": part_label(part),
         "year": year,
         "event_date": event_date,
         "venue": event.get("venue") or "",
@@ -438,31 +470,31 @@ for message in st.session_state.pop("flash", []):
 # Header
 # ---------------------------------------------------------------------------
 
-st.markdown(f"### General Gathering {part}, {year}")
+st.markdown(f"### {part_label(part)}, {year}")
 st.markdown(
     f"""
 <div class="countdown {'late' if late else ''}">
-  <div class="days">{max(days_out, 0)}<small>days to the gathering</small></div>
-  <div class="meta">Gathering date<b>{event_date:%A, %d %B %Y}</b></div>
+  <div class="days">{max(days_out, 0)}<small>days to the assembly</small></div>
+  <div class="meta">Assembly date<b>{event_date:%A, %d %B %Y}</b></div>
   <div class="meta">Recruitment closes<b>{deadline:%d %B} &nbsp;·&nbsp; {'closed' if late else f'{days_to_deadline} days left'}</b></div>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-tab_ready, tab_depts, tab_vols, tab_docs, tab_settings = st.tabs(
-    ["Readiness", "Departments", "Volunteers", "Documents", "Settings"]
+tab_dash, tab_depts, tab_vols, tab_docs, tab_settings = st.tabs(
+    ["Dashboard", "Departments", "Volunteers", "Documents", "Settings"]
 )
 
 # ---------------------------------------------------------------------------
-# Readiness
+# Dashboard
 # ---------------------------------------------------------------------------
 
-with tab_ready:
+with tab_dash:
     left, right = st.columns(2, gap="large")
 
     with left:
-        st.markdown("#### Your checklist")
+        st.markdown("#### Checklist")
         items = CHECKLIST[role]
         saved = dict(event["checklist"])
         done = sum(1 for k, _ in items if saved.get(k))
@@ -471,11 +503,17 @@ with tab_ready:
         st.markdown(f'<p class="note">{done} of {len(items)} confirmed</p>', unsafe_allow_html=True)
 
         changed = False
-        for key, label in items:
-            value = st.checkbox(label, value=bool(saved.get(key)), key=f"chk_{event_key}_{key}")
-            if value != bool(saved.get(key)):
-                saved[key] = value
-                changed = True
+        for heading, group in (
+            (f"As {role.lower()}", ROLE_CHECKLIST[role]),
+            ("Both of you", SHARED_CHECKLIST),
+        ):
+            st.markdown(f'<p class="note" style="margin-top:.7rem"><b>{heading}</b></p>',
+                        unsafe_allow_html=True)
+            for key, label in group:
+                value = st.checkbox(label, value=bool(saved.get(key)), key=f"chk_{event_key}_{key}")
+                if value != bool(saved.get(key)):
+                    saved[key] = value
+                    changed = True
         if changed:
             store.save_event(DB, event_key, event_date, event.get("venue") or "", saved, actor=actor)
             st.rerun()
@@ -570,7 +608,7 @@ with tab_depts:
             keymen = st.text_input("Keymen", value=d.get("keymen", ""), help="Separate with commas")
         with c2:
             meet = st.date_input(
-                "Pre-gathering meeting",
+                "Personnel meeting",
                 value=date.fromisoformat(d["meeting_date"])
                 if d.get("meeting_date")
                 else event_date - timedelta(days=21),
@@ -762,7 +800,7 @@ with tab_vols:
             b1, b2 = st.columns(2)
             back_dept = b1.selectbox("Department", ALL_DEPTS, key="prev_dept")
             back_shift = b2.selectbox("Shift", shift_names(), key="prev_shift")
-            if st.button("Add to this gathering", disabled=not picked):
+            if st.button("Add to this assembly", disabled=not picked):
                 for label in picked:
                     store.add_person_to_event(
                         DB, event_key, look[label], back_dept, back_shift, actor=actor
@@ -876,7 +914,7 @@ with tab_vols:
                         f'<span class="state">{n} awaiting reply</span></div>',
                         unsafe_allow_html=True,
                     )
-                lines = [f"General Gathering {part}, {year} — {event_date:%d %B}"]
+                lines = [f"{part_label(part)}, {year} — {event_date:%d %B}"]
                 for dept_name, group in pending.groupby("Department"):
                     lines.append(f"\n{dept_name}:")
                     lines += [f"  {v['Name']} ({v['Shift']})" for _, v in group.iterrows()]
@@ -1019,7 +1057,7 @@ def sheets_problems() -> list[str]:
 with tab_settings:
     st.markdown("#### Backup")
     st.markdown(
-        '<p class="note">Everything in the database, not just this gathering. The '
+        '<p class="note">Everything in the database, not just this assembly. The '
         "file name carries the date and time, so downloads pile up as a history.</p>",
         unsafe_allow_html=True,
     )
@@ -1029,14 +1067,14 @@ with tab_settings:
         facts = store.describe_backup(st.session_state["dump"])
         st.markdown(
             f'<p class="note">{facts["people"]} people across {len(facts["gatherings"])} '
-            f'{"gathering" if len(facts["gatherings"]) == 1 else "gatherings"}, '
+            f'{"assembly" if len(facts["gatherings"]) == 1 else "assemblies"}, '
             f'read {facts["exported_at"].replace("T", " ")[:16]}.</p>',
             unsafe_allow_html=True,
         )
         st.download_button(
             "Download backup (JSON)",
             json.dumps(st.session_state["dump"], indent=1),
-            file_name=f"gathering_backup_{datetime.now():%Y%m%d_%H%M}.json",
+            file_name=f"assembly_backup_{datetime.now():%Y%m%d_%H%M}.json",
             mime="application/json",
             type="primary",
         )
@@ -1214,9 +1252,9 @@ with tab_settings:
                 width="stretch",
             )
 
-    with st.expander("Delete this gathering"):
+    with st.expander("Delete this assembly"):
         st.markdown(
-            f'<p class="note">This gathering holds {len(named)} names. Records are '
+            f'<p class="note">This assembly holds {len(named)} names. Records are '
             "normally kept so next year can be copied forward — delete only if it "
             "was entered by mistake.</p>",
             unsafe_allow_html=True,
