@@ -269,6 +269,16 @@ def log(db: Database, actor: str, event_key: str, area: str, detail: str) -> Non
     )
 
 
+def data_stamp(db: Database, event_key: str) -> str:
+    """Changes when anything about this gathering does — including another
+    person's edit, since it reads the shared changes table rather than a
+    counter held in one session."""
+    row = db.rows(
+        "SELECT COUNT(*) AS n, MAX(at) AS last FROM changes WHERE event_key = ?", (event_key,)
+    )[0]
+    return f"{row['n']}:{row['last']}"
+
+
 def recent_changes(db: Database, event_key: str, limit: int = 25) -> list:
     rows = db.rows(
         "SELECT at, actor, area, detail FROM changes WHERE event_key = ? "
@@ -620,6 +630,7 @@ def add_person_to_event(
         "VALUES (?, ?, ?, ?, ?, 'Invited', '')",
         (str(uuid.uuid4()), key, person_id, dept, shift),
     )
+    log(db, actor, key, dept, "a returning volunteer added")
 
 
 def add_names(
@@ -892,9 +903,10 @@ TABLES = {
 
 
 def _ensure_meta(db: Database) -> None:
-    db.run(
-        "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, at TEXT)"
-    )
+    if getattr(db, "_meta_ready", False):
+        return
+    db.run("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, at TEXT)")
+    db._meta_ready = True
 
 
 def set_meta(db: Database, key: str, value: str = "") -> None:

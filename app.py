@@ -269,11 +269,33 @@ if not st.session_state.event_key:
     st.stop()
 
 event_key = st.session_state.event_key
-event = store.load_event(DB, event_key)
-dept_state = store.load_departments(DB, event_key)
-shift_rows = store.load_shifts(DB, event_key) or [dict(s) for s in DEFAULT_SHIFTS]
-target_rows = store.load_targets(DB, event_key)
-vol_rows = store.load_volunteers(DB, event_key)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def load_bundle(key: str, stamp: str) -> dict:
+    """Everything one page render needs, read once.
+
+    Streamlit re-runs the whole script on every click, so without this each
+    tick of a checkbox re-read the same seven tables. The stamp comes from the
+    shared changes log, so another person's edit invalidates this too.
+    """
+    return {
+        "event": store.load_event(DB, key),
+        "departments": store.load_departments(DB, key),
+        "shifts": store.load_shifts(DB, key),
+        "targets": store.load_targets(DB, key),
+        "volunteers": store.load_volunteers(DB, key),
+        "stranded": store.stranded_shifts(DB, key),
+        "removed": store.load_removed(DB, key),
+    }
+
+
+bundle = load_bundle(event_key, store.data_stamp(DB, event_key))
+event = bundle["event"]
+dept_state = bundle["departments"]
+shift_rows = bundle["shifts"] or [dict(s) for s in DEFAULT_SHIFTS]
+target_rows = bundle["targets"]
+vol_rows = bundle["volunteers"]
 
 event_date = date.fromisoformat(event["event_date"])
 part, year = event_key.rsplit(" ", 1)
@@ -688,7 +710,7 @@ with tab_vols:
             flash(f"{old_name} is now {new_name.strip()}, with {moved} volunteers.")
             st.rerun()
 
-    stranded = store.stranded_shifts(DB, event_key)
+    stranded = bundle["stranded"]
     if stranded:
         st.warning(
             "On a shift that no longer exists: "
@@ -737,7 +759,7 @@ with tab_vols:
                 st.session_state.pop("previous", None)
                 st.rerun()
 
-    removed_rows = store.load_removed(DB, event_key)
+    removed_rows = bundle["removed"]
     if removed_rows:
         with st.expander(f"Recently removed ({len(removed_rows)})"):
             for r in removed_rows[:15]:
@@ -1037,6 +1059,7 @@ with tab_settings:
                         DB, incoming, "replace" if danger else "merge", actor=actor
                     )
                     written = ", ".join(f"{v} {k}" for k, v in counts.items() if v)
+                    load_bundle.clear()
                     flash(f"Restored: {written or 'nothing new to add'}.")
                     st.session_state.event_key = None
                     st.rerun()
@@ -1046,7 +1069,7 @@ with tab_settings:
     st.divider()
     st.markdown("#### Google Sheets")
     gaps = sheets_problems()
-    last_push = store.get_meta(DB, "last_sheets_push")
+    last_push = {} if gaps else store.get_meta(DB, "last_sheets_push")
     if gaps:
         st.markdown(
             '<p class="note">Not ready yet: ' + "; ".join(gaps) + ".</p>", unsafe_allow_html=True
@@ -1152,7 +1175,9 @@ with tab_settings:
     )
 
     with st.expander("Who changed what"):
-        entries = store.recent_changes(DB, event_key, 50)
+        if st.button("Show recent changes", key="show_log"):
+            st.session_state["log"] = store.recent_changes(DB, event_key, 50)
+        entries = st.session_state.get("log") or []
         if not entries:
             st.markdown('<p class="note">Nothing recorded yet.</p>', unsafe_allow_html=True)
         else:
