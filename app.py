@@ -923,8 +923,25 @@ with tab_docs:
     stem = f"{part.replace(' ', '')}_{year}"
     ctx = doc_context()
 
-    only_confirmed = st.checkbox("Confirmed volunteers only", value=True, key="doc_conf")
+    c_top1, c_top2 = st.columns([2, 3])
+    only_confirmed = c_top1.checkbox("Confirmed volunteers only", value=True, key="doc_conf")
+    fmt = c_top2.radio(
+        "Format", ["PDF", "Word", "Web page", "CSV"], horizontal=True, key="doc_fmt"
+    )
     frame = named[named["Status"] == "Confirmed"] if only_confirmed and not named.empty else named
+
+    BUILDERS = {
+        "PDF": (docs.master_list_pdf, docs.rotation_pdf, "pdf", "application/pdf"),
+        "Word": (
+            docs.master_list_docx,
+            docs.rotation_docx,
+            "docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        "Web page": (docs.master_list_html, docs.rotation_html, "html", "text/html"),
+        "CSV": (docs.master_csv, docs.rotation_csv, "csv", "text/csv"),
+    }
+    make_master, make_rotation, suffix, mime = BUILDERS[fmt]
 
     c1, c2 = st.columns(2, gap="large")
     with c1:
@@ -934,14 +951,6 @@ with tab_docs:
             "assistant and keymen above the names.</p>",
             unsafe_allow_html=True,
         )
-        st.download_button(
-            "Master list",
-            docs.master_list_html(frame, ctx),
-            file_name=f"{stem}_master_list.html",
-            mime="text/html",
-            type="primary",
-            width="stretch",
-        )
     with c2:
         st.markdown("#### Rotation list")
         st.markdown(
@@ -949,29 +958,29 @@ with tab_docs:
             "can see who takes over.</p>",
             unsafe_allow_html=True,
         )
-        st.download_button(
-            "Rotation list",
-            docs.rotation_html(frame, ctx),
-            file_name=f"{stem}_rotation.html",
-            mime="text/html",
+
+    try:
+        master_file = make_master(frame, ctx)
+        rotation_file = make_rotation(frame, ctx)
+    except ModuleNotFoundError as exc:
+        missing = "python-docx" if fmt == "Word" else "reportlab"
+        st.error(f"{fmt} needs the {missing} package — add it to requirements.txt. ({exc})")
+    else:
+        b1, b2 = st.columns(2, gap="large")
+        b1.download_button(
+            f"Master list ({fmt})",
+            master_file,
+            file_name=f"{stem}_master_list.{suffix}",
+            mime=mime,
             type="primary",
             width="stretch",
         )
-
-    with st.expander("Also as CSV"):
-        d1, d2 = st.columns(2)
-        d1.download_button(
-            "Master list (CSV)",
-            docs.master_csv(frame, ctx),
-            file_name=f"{stem}_master_list.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-        d2.download_button(
-            "Rotation list (CSV)",
-            docs.rotation_csv(frame, ctx),
-            file_name=f"{stem}_rotation.csv",
-            mime="text/csv",
+        b2.download_button(
+            f"Rotation list ({fmt})",
+            rotation_file,
+            file_name=f"{stem}_rotation.{suffix}",
+            mime=mime,
+            type="primary",
             width="stretch",
         )
 

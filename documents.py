@@ -28,6 +28,14 @@ PRINT_CSS = """
 """
 
 
+def in_shift_order(rows: pd.DataFrame, ctx: dict) -> pd.DataFrame:
+    """Alphabetical order would put Afternoon before Morning."""
+    order = {name: i for i, name in enumerate(ctx["shifts"])}
+    return rows.assign(_seq=rows["Shift"].map(lambda s: order.get(s, len(order)))).sort_values(
+        ["_seq", "Name"]
+    ).drop(columns="_seq")
+
+
 def _lead(ctx: dict, dept: str) -> str:
     d = ctx["departments"].get(dept, {})
     bits = []
@@ -53,7 +61,7 @@ def _header(ctx: dict, title: str, extra: str = "") -> str:
 def master_list_html(frame: pd.DataFrame, ctx: dict) -> str:
     sections = []
     for dept in ctx["dept_order"]:
-        rows = frame[frame["Department"] == dept].sort_values(["Shift", "Name"])
+        rows = in_shift_order(frame[frame["Department"] == dept], ctx)
         body = "".join(
             f"<tr><td class='num'>{i}</td><td>{r['Name']}</td><td>{r['Congregation']}</td>"
             f"<td>{r['Gender']}</td><td>{r['Privilege']}</td><td>{r['Shift']}</td>"
@@ -127,7 +135,7 @@ def master_frame(frame: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     out = []
     for dept in ctx["dept_order"]:
         d = ctx["departments"].get(dept, {})
-        for _, r in frame[frame["Department"] == dept].sort_values(["Shift", "Name"]).iterrows():
+        for _, r in in_shift_order(frame[frame["Department"] == dept], ctx).iterrows():
             out.append(
                 {
                     "Department": dept,
@@ -159,3 +167,298 @@ def rotation_table(frame: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
 def rotation_csv(frame: pd.DataFrame, ctx: dict) -> str:
     return rotation_table(frame, ctx).to_csv(index=False)
+
+
+# ---------------------------------------------------------------------------
+# Word and PDF
+#
+# Both are generated in pure Python so they work on Streamlit Cloud, where
+# there is no LibreOffice and no Node. The libraries are imported inside the
+# functions, so the app still starts if they are missing.
+# ---------------------------------------------------------------------------
+
+INK = "16202B"
+PAPER = "F7F5F0"
+LINE = "DCD8CF"
+SOFT = "5B6B7C"
+
+
+def _subtitle(ctx: dict, extra: str = "") -> str:
+    venue = f" · {ctx['venue']}" if ctx.get("venue") else ""
+    return (
+        f"General Gathering {ctx['part']}, {ctx['year']} · "
+        f"{ctx['event_date']:%A, %d %B %Y}{venue}{extra} · printed {ctx['today']:%d %B %Y}"
+    )
+
+
+def _plain_lead(ctx: dict, dept: str) -> str:
+    return _lead(ctx, dept).replace(" &nbsp;·&nbsp; ", " · ")
+
+
+def _master_sections(frame: pd.DataFrame, ctx: dict):
+    """(department, lead line, header row, body rows) for each department."""
+    header = ["", "Name", "Congregation", "Gender", "Privilege", "Shift", "Status"]
+    for dept in ctx["dept_order"]:
+        rows = in_shift_order(frame[frame["Department"] == dept], ctx)
+        body = [
+            [
+                str(i),
+                r["Name"],
+                r["Congregation"],
+                r["Gender"],
+                r["Privilege"],
+                r["Shift"],
+                r["Status"],
+            ]
+            for i, (_, r) in enumerate(rows.iterrows(), start=1)
+        ]
+        yield dept, _plain_lead(ctx, dept), header, body, len(rows)
+
+
+def _rotation_sections(frame: pd.DataFrame, ctx: dict):
+    for dept in ctx["dept_order"]:
+        table = rotation_frame(frame, ctx, dept)
+        if table.empty:
+            continue
+        header = [""] + [f"{c}\n{ctx['hours'].get(c) or '—'}" for c in table.columns]
+        body = [
+            [str(i + 1)] + [str(v) for v in row]
+            for i, row in enumerate(table.itertuples(index=False))
+        ]
+        counts = " · ".join(f"{c}: {(table[c] != '').sum()}" for c in table.columns)
+        yield dept, _plain_lead(ctx, dept), header, body, counts
+
+
+def _docx(title: str, subtitle: str, sections, widths) -> bytes:
+    from io import BytesIO
+
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Cm, Pt, RGBColor
+
+    doc = Document()
+    for section in doc.sections:
+        section.top_margin = section.bottom_margin = Cm(1.5)
+        section.left_margin = section.right_margin = Cm(1.5)
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Helvetica"
+    normal.font.size = Pt(9)
+
+    heading = doc.add_paragraph()
+    run = heading.add_run(title)
+    run.bold = True
+    run.font.size = Pt(16)
+    run.font.color.rgb = RGBColor.from_string(INK)
+
+    sub = doc.add_paragraph()
+    sub_run = sub.add_run(subtitle)
+    sub_run.font.size = Pt(8)
+    sub_run.font.color.rgb = RGBColor.from_string(SOFT)
+
+    for dept, lead, header, body, tail in sections:
+        h = doc.add_paragraph()
+        h_run = h.add_run(dept)
+        h_run.bold = True
+        h_run.font.size = Pt(12)
+
+        lead_p = doc.add_paragraph()
+        lead_run = lead_p.add_run(lead)
+        lead_run.font.size = Pt(8)
+        lead_run.font.color.rgb = RGBColor.from_string(SOFT)
+
+        table = doc.add_table(rows=1, cols=len(header))
+        table.style = "Table Grid"
+        # Word ignores cell widths unless autofit is off, and then wraps names
+        table.autofit = False
+        for column, width in zip(table.columns, widths(len(header))):
+            column.width = Cm(width)
+        for cell, text, width in zip(table.rows[0].cells, header, widths(len(header))):
+            cell.width = Cm(width)
+            para = cell.paragraphs[0]
+            cell_run = para.add_run(text.replace("\n", " "))
+            cell_run.bold = True
+            cell_run.font.size = Pt(8)
+
+        for line in body or [["", "No volunteers recorded."] + [""] * (len(header) - 2)]:
+            cells = table.add_row().cells
+            for cell, text, width in zip(cells, line, widths(len(header))):
+                cell.width = Cm(width)
+                cell_run = cell.paragraphs[0].add_run(str(text))
+                cell_run.font.size = Pt(8.5)
+
+        foot = doc.add_paragraph()
+        foot_run = foot.add_run(f"{tail} volunteers" if isinstance(tail, int) else str(tail))
+        foot_run.font.size = Pt(8)
+        foot_run.font.color.rgb = RGBColor.from_string(SOFT)
+        foot.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    buffer = BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
+
+
+def _pdf(title: str, subtitle: str, sections, col_widths) -> bytes:
+    from io import BytesIO
+
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        KeepTogether,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        title=title,
+    )
+    base = getSampleStyleSheet()
+    ink = colors.HexColor(f"#{INK}")
+    soft = colors.HexColor(f"#{SOFT}")
+
+    title_style = ParagraphStyle(
+        "title", parent=base["Title"], fontSize=17, alignment=TA_LEFT, textColor=ink, spaceAfter=2
+    )
+    sub_style = ParagraphStyle("sub", parent=base["Normal"], fontSize=8.5, textColor=soft)
+    dept_style = ParagraphStyle(
+        "dept", parent=base["Heading2"], fontSize=12, textColor=ink, spaceBefore=0, spaceAfter=1
+    )
+    lead_style = ParagraphStyle("lead", parent=base["Normal"], fontSize=8, textColor=soft)
+    cell_style = ParagraphStyle("cell", parent=base["Normal"], fontSize=8.5, leading=10)
+    head_style = ParagraphStyle("head", parent=cell_style, fontSize=8, textColor=ink)
+
+    story = [Paragraph(title, title_style), Paragraph(subtitle, sub_style), Spacer(1, 6 * mm)]
+
+    for dept, lead, header, body, tail in sections:
+        widths = col_widths(len(header), doc.width)
+        data = [[Paragraph(h.replace("\n", "<br/>"), head_style) for h in header]]
+        for line in body or [["", "No volunteers recorded."] + [""] * (len(header) - 2)]:
+            data.append([Paragraph(str(v), cell_style) for v in line])
+
+        table = Table(data, colWidths=widths, repeatRows=1)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(f"#{PAPER}")),
+                    ("LINEBELOW", (0, 0), (-1, -1), 0.4, colors.HexColor(f"#{LINE}")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+                ]
+            )
+        )
+        foot = f"{tail} volunteers" if isinstance(tail, int) else str(tail)
+        story.append(
+            KeepTogether(
+                [
+                    Paragraph(dept, dept_style),
+                    Paragraph(lead, lead_style),
+                    Spacer(1, 2 * mm),
+                    table,
+                    Spacer(1, 1 * mm),
+                    Paragraph(foot, lead_style),
+                    Spacer(1, 6 * mm),
+                ]
+            )
+        )
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def _master_widths_cm(n: int) -> list:
+    return [0.9, 4.2, 3.6, 1.8, 2.2, 2.6, 2.2][:n]
+
+
+def _master_widths_pt(n: int, total: float) -> list:
+    share = [0.05, 0.24, 0.21, 0.1, 0.13, 0.15, 0.12][:n]
+    return [total * s for s in share]
+
+
+def _even_widths_cm(n: int) -> list:
+    return [0.9] + [(17.0 - 0.9) / max(n - 1, 1)] * (n - 1)
+
+
+def _even_widths_pt(n: int, total: float) -> list:
+    first = total * 0.05
+    return [first] + [(total - first) / max(n - 1, 1)] * (n - 1)
+
+
+def master_list_docx(frame: pd.DataFrame, ctx: dict) -> bytes:
+    return _docx(
+        "Master volunteer list",
+        _subtitle(ctx, f" · {len(frame)} volunteers"),
+        _master_sections(frame, ctx),
+        lambda n: _master_widths_cm(n),
+    )
+
+
+def rotation_docx(frame: pd.DataFrame, ctx: dict) -> bytes:
+    return _docx(
+        "Department rotation list",
+        _subtitle(ctx),
+        _rotation_sections(frame, ctx),
+        lambda n: _even_widths_cm(n),
+    )
+
+
+def master_list_pdf(frame: pd.DataFrame, ctx: dict) -> bytes:
+    return _pdf(
+        "Master volunteer list",
+        _subtitle(ctx, f" · {len(frame)} volunteers"),
+        _master_sections(frame, ctx),
+        _master_widths_pt,
+    )
+
+
+def rotation_pdf(frame: pd.DataFrame, ctx: dict) -> bytes:
+    return _pdf(
+        "Department rotation list", _subtitle(ctx), _rotation_sections(frame, ctx), _even_widths_pt
+    )
+
+
+# ---------------------------------------------------------------------------
+# Word and PDF
+#
+# The heavy lifting lives in exports.py, which imports from this module — so
+# these wrappers import it lazily rather than at the top of the file.
+# ---------------------------------------------------------------------------
+
+
+def master_list_docx(frame: pd.DataFrame, ctx: dict) -> bytes:
+    from exports import master_docx
+
+    return master_docx(frame, ctx)
+
+
+def rotation_docx(frame: pd.DataFrame, ctx: dict) -> bytes:
+    from exports import rotation_docx as build
+
+    return build(frame, ctx)
+
+
+def master_list_pdf(frame: pd.DataFrame, ctx: dict) -> bytes:
+    from exports import master_pdf
+
+    return master_pdf(frame, ctx)
+
+
+def rotation_pdf(frame: pd.DataFrame, ctx: dict) -> bytes:
+    from exports import rotation_pdf as build
+
+    return build(frame, ctx)
