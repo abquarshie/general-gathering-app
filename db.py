@@ -423,6 +423,14 @@ def rename_shift(db: Database, key: str, old: str, new: str, actor: str = "") ->
     return int(moved)
 
 
+def half_of(start: str) -> str:
+    """Before midday is the morning half, after it the afternoon."""
+    try:
+        return "Morning" if int(str(start).split(":")[0]) < 12 else "Afternoon"
+    except (ValueError, IndexError):
+        return "Morning"
+
+
 def save_shifts(db: Database, key: str, rows: list, actor: str = "") -> None:
     pairs = [("DELETE FROM shifts WHERE event_key = ?", (key,))]
     for i, r in enumerate(rows):
@@ -436,7 +444,7 @@ def save_shifts(db: Database, key: str, rows: list, actor: str = "") -> None:
                 (
                     key,
                     name,
-                    str(r.get("Half") or "Morning"),
+                    half_of(r.get("Start")),
                     str(r.get("Report") or ""),
                     str(r.get("Start") or ""),
                     str(r.get("End") or ""),
@@ -671,78 +679,52 @@ def _repoint_person(db: Database, person_id: str, fields: dict) -> str:
 def save_volunteers(db: Database, key: str, rows: list, actor: str = "") -> dict:
     """Write the edited grid back.
 
-    Rows arrive from a table editor without ids, so each is matched to the
-    person it names — name plus congregation, which is why the congregation
-    column matters for two people called the same thing. Rows that disappear
+    Each row carries the assignment id it came from, so an edit is an update
+    and a new row is an insert — no guessing from names. Rows that disappear
     are flagged rather than deleted, so they can be restored.
     """
-    existing = load_volunteers(db, key)
-    by_person = {r["person_id"]: r for r in existing}
-    index = {
-        (str(r["name"]).strip().lower(), str(r["congregation"] or "").strip().lower()): r
-        for r in existing
-    }
+    existing = {r["id"]: r for r in load_volunteers(db, key)}
     counts = {"added": 0, "changed": 0, "removed": 0}
-    claimed = set()
-    leftovers = []
+    seen = set()
 
     for row in rows:
         name = str(row.get("name", "")).strip()
         if not name:
             continue
-        cong = str(row.get("congregation", "") or "").strip()
-        fields = tuple(
-            str(row.get(f, "") or "") for f in ("dept", "shift", "status", "notes")
-        )
         person = {f: str(row.get(f, "") or "") for f in PERSON_FIELDS}
+        fields = tuple(str(row.get(f, "") or "") for f in ("dept", "shift", "status", "notes"))
+        aid = str(row.get("id") or "").strip()
+        before = existing.get(aid)
 
-        match = index.get((name.lower(), cong.lower()))
-        if match and match["id"] not in claimed:
-            claimed.add(match["id"])
-            ensure_person(db, person)
-            was = (
-                match["dept"] or "",
-                match["shift"] or "",
-                match["status"] or "",
-                match["notes"] or "",
-            )
-            if was != fields:
-                db.run(
-                    "UPDATE assignments SET dept = ?, shift = ?, status = ?, notes = ? WHERE id = ?",
-                    (*fields, match["id"]),
-                )
-                counts["changed"] += 1
-        else:
-            leftovers.append((person, fields))
-
-    # Rows whose name changed are matched to whatever is left over, so that a
-    # corrected spelling edits the person instead of deleting and re-adding.
-    spare = [r for r in existing if r["id"] not in claimed]
-    for person, fields in leftovers:
-        if spare:
-            target = spare.pop(0)
-            claimed.add(target["id"])
-            pid = _repoint_person(db, target["person_id"], person)
-            db.run(
-                "UPDATE assignments SET person_id = ?, dept = ?, shift = ?, status = ?, notes = ? "
-                "WHERE id = ?",
-                (pid, *fields, target["id"]),
-            )
-            counts["changed"] += 1
-        else:
-            pid = ensure_person(db, person)
+        if before is None:
             db.run(
                 "INSERT INTO assignments (id, event_key, person_id, dept, shift, status, notes) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), key, pid, *fields),
+                (str(uuid.uuid4()), key, ensure_person(db, person), *fields),
             )
             counts["added"] += 1
+            continue
 
-    for r in existing:
-        if r["id"] not in claimed:
+        seen.add(aid)
+        was = tuple(before.get(f) or "" for f in ("dept", "shift", "status", "notes"))
+        person_changed = any(str(before.get(f) or "") != person[f] for f in PERSON_FIELDS)
+
+        if person_changed:
+            pid = _repoint_person(db, before["person_id"], person)
+            db.run("UPDATE assignments SET person_id = ? WHERE id = ?", (pid, aid))
+        if was != fields:
+            db.run(
+                "UPDATE assignments SET dept = ?, shift = ?, status = ?, notes = ? WHERE id = ?",
+                (*fields, aid),
+            )
+        if person_changed or was != fields:
+            counts["changed"] += 1
+
+    for aid in existing:
+        if aid not in seen:
             db.run(
                 "UPDATE assignments SET removed_at = ? WHERE id = ?",
-                (datetime.now().isoformat(timespec="seconds"), r["id"]),
+                (datetime.now().isoformat(timespec="seconds"), aid),
             )
             counts["removed"] += 1
 
