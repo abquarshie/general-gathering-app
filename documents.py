@@ -64,14 +64,14 @@ def master_list_html(frame: pd.DataFrame, ctx: dict) -> str:
         rows = in_shift_order(frame[frame["Department"] == dept], ctx)
         body = "".join(
             f"<tr><td class='num'>{i}</td><td>{r['Name']}</td><td>{r['Congregation']}</td>"
-            f"<td>{r['Gender']}</td><td>{r['Privilege']}</td><td>{r['Shift']}</td>"
-            f"<td>{r['Status']}</td></tr>"
+            f"<td>{r.get('Phone', '')}</td><td>{r['Gender']}</td><td>{r['Privilege']}</td>"
+            f"<td>{r['Shift']}</td><td>{r['Status']}</td></tr>"
             for i, (_, r) in enumerate(rows.iterrows(), start=1)
-        ) or "<tr><td colspan='7'>No volunteers recorded.</td></tr>"
+        ) or "<tr><td colspan='8'>No volunteers recorded.</td></tr>"
         sections.append(
             f"<section><h2>{dept}</h2><p class='lead'>{_lead(ctx, dept)}</p>"
-            "<table><tr><th></th><th>Name</th><th>Congregation</th><th>Gender</th>"
-            f"<th>Privilege</th><th>Shift</th><th>Status</th></tr>{body}</table>"
+            "<table><tr><th></th><th>Name</th><th>Congregation</th><th>Phone</th>"
+            f"<th>Gender</th><th>Privilege</th><th>Shift</th><th>Status</th></tr>{body}</table>"
             f"<p class='lead'>{len(rows)} volunteers</p></section>"
         )
     extra = f" &middot; {len(frame)} volunteers"
@@ -123,6 +123,7 @@ MASTER_COLUMNS = [
     "Keymen",
     "Name",
     "Congregation",
+    "Phone",
     "Gender",
     "Privilege",
     "Shift",
@@ -144,6 +145,7 @@ def master_frame(frame: pd.DataFrame, ctx: dict) -> pd.DataFrame:
                     "Keymen": d.get("keymen", ""),
                     "Name": r["Name"],
                     "Congregation": r["Congregation"],
+                    "Phone": r.get("Phone", ""),
                     "Gender": r["Gender"],
                     "Privilege": r["Privilege"],
                     "Shift": r["Shift"],

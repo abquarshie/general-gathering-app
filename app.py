@@ -69,12 +69,23 @@ CONGREGATIONS = [
 GENDERS = ["Male", "Female"]
 PRIVILEGES = ["Elder", "Servant", "Publisher"]
 STATUSES = ["Confirmed", "Invited", "Unavailable", "Moved out"]
-GRID_COLUMNS = ["Name", "Gender", "Privilege", "Congregation", "Department", "Shift", "Status", "Notes"]
+GRID_COLUMNS = [
+    "Name",
+    "Gender",
+    "Privilege",
+    "Congregation",
+    "Phone",
+    "Department",
+    "Shift",
+    "Status",
+    "Notes",
+]
 DB_FIELDS = {
     "Name": "name",
     "Gender": "gender",
     "Privilege": "privilege",
     "Congregation": "congregation",
+    "Phone": "phone",
     "Department": "dept",
     "Shift": "shift",
     "Status": "status",
@@ -197,6 +208,10 @@ CSS = """
 .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: .35rem 0 1rem; }
 .bar > span { display: block; height: 100%; background: var(--ink); }
 .note { color: var(--ink-soft); font-size: .9rem; }
+@media (prefers-color-scheme: dark) {
+  :root { --ink-soft: #9aa7b4; --line: #3a4552; }
+  .row .owner, .row .state { color: #9aa7b4; }
+}
 .stTabs [data-baseweb="tab-list"] { gap: 1.6rem; border-bottom: 1px solid var(--line); }
 .stTabs [data-baseweb="tab"] { padding: .4rem 0; font-weight: 600; background: transparent; }
 section[data-testid="stSidebar"] { border-right: 1px solid var(--line); }
@@ -225,7 +240,9 @@ if st.session_state.get("role") and auth.session_expired():
     st.warning("Signed out after four hours idle.")
 
 if not st.session_state.get("role"):
-    auth.login_screen(APP_TITLE, DB.label, set(CHECKLIST))
+    middle = st.columns([1, 2, 1])[1]
+    with middle:
+        auth.login_screen(APP_TITLE, DB.label, set(CHECKLIST))
     st.stop()
 
 role: str = st.session_state.role
@@ -504,7 +521,7 @@ with tab_dash:
 
         changed = False
         for heading, group in (
-            (f"As {role.lower()}", ROLE_CHECKLIST[role]),
+            (f"As {role.lower()} (pre-assembly / personnel meeting)", ROLE_CHECKLIST[role]),
             ("Both of you", SHARED_CHECKLIST),
         ):
             st.markdown(f'<p class="note" style="margin-top:.7rem"><b>{heading}</b></p>',
@@ -828,7 +845,7 @@ with tab_vols:
     st.markdown("#### Master volunteer list")
     base = volunteers_df()
     f1, f2, f3 = st.columns([3, 2, 2])
-    search = f1.text_input("Find by name or congregation", key=f"f_name_{event_key}")
+    search = f1.text_input("Find by name, congregation or number", key=f"f_name_{event_key}")
     f_dept = f2.multiselect("Department", ALL_DEPTS, key=f"f_dept_{event_key}")
     f_status = f3.multiselect("Status", STATUSES, key=f"f_status_{event_key}")
 
@@ -838,9 +855,11 @@ with tab_vols:
         mask = pd.Series(True, index=base.index)
         if search.strip():
             term = search.strip()
-            mask &= base["Name"].str.contains(term, case=False, na=False) | base[
-                "Congregation"
-            ].str.contains(term, case=False, na=False)
+            mask &= (
+                base["Name"].str.contains(term, case=False, na=False)
+                | base["Congregation"].str.contains(term, case=False, na=False)
+                | base["Phone"].str.contains(term, case=False, na=False)
+            )
         if f_dept:
             mask &= base["Department"].isin(f_dept)
         if f_status:
@@ -862,6 +881,7 @@ with tab_vols:
             "Congregation": st.column_config.SelectboxColumn(
                 options=congregation_options(), width="medium"
             ),
+            "Phone": st.column_config.TextColumn(width="small"),
             "Department": st.column_config.SelectboxColumn(options=ALL_DEPTS, width="medium"),
             "Shift": st.column_config.SelectboxColumn(options=shift_names(), width="small"),
             "Status": st.column_config.SelectboxColumn(options=STATUSES, width="small"),
@@ -917,8 +937,18 @@ with tab_vols:
                 lines = [f"{part_label(part)}, {year} — {event_date:%d %B}"]
                 for dept_name, group in pending.groupby("Department"):
                     lines.append(f"\n{dept_name}:")
-                    lines += [f"  {v['Name']} ({v['Shift']})" for _, v in group.iterrows()]
+                    for _, v in group.iterrows():
+                        number = f" — {v['Phone']}" if str(v["Phone"]).strip() else ""
+                        lines.append(f"  {v['Name']} ({v['Shift']}){number}")
                 st.text_area("Copy into a message", "\n".join(lines), height=180, key="chase_text")
+
+                no_number = pending[pending["Phone"].str.strip() == ""]
+                if not no_number.empty:
+                    st.markdown(
+                        f'<p class="note">{len(no_number)} of them have no number on '
+                        "file.</p>",
+                        unsafe_allow_html=True,
+                    )
 
         c_left, c_right = st.columns(2, gap="large")
         with c_left:

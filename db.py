@@ -74,6 +74,7 @@ SCHEMA = [
         gender       TEXT DEFAULT '',
         privilege    TEXT DEFAULT '',
         congregation TEXT DEFAULT '',
+        phone        TEXT DEFAULT '',
         created_at   TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS assignments (
@@ -108,6 +109,7 @@ SCHEMA = [
 # Step 1 is the baseline every table above already creates.
 MIGRATIONS: list = [
     (1, []),
+    (2, ["ALTER TABLE people ADD COLUMN phone TEXT DEFAULT ''"]),
 ]
 
 
@@ -281,6 +283,7 @@ class Database:
                     "gender": r["gender"] or "",
                     "privilege": r["privilege"] or "",
                     "congregation": "",
+                    "phone": "",
                 },
             )
             self.run(
@@ -624,7 +627,7 @@ def save_dept_targets(db: Database, key: str, dept: str, rows: list, actor: str 
 # People
 # ---------------------------------------------------------------------------
 
-PERSON_FIELDS = ("name", "gender", "privilege", "congregation")
+PERSON_FIELDS = ("name", "gender", "privilege", "congregation", "phone")
 
 
 def find_person(db: Database, name: str, congregation: str):
@@ -642,7 +645,7 @@ def ensure_person(db: Database, fields: dict) -> str:
     if found:
         changed = {
             f: str(fields.get(f, "") or "")
-            for f in ("gender", "privilege")
+            for f in ("gender", "privilege", "phone")
             if str(fields.get(f, "") or "") and str(fields.get(f) or "") != (found.get(f) or "")
         }
         if changed:
@@ -652,14 +655,15 @@ def ensure_person(db: Database, fields: dict) -> str:
 
     pid = str(uuid.uuid4())
     db.run(
-        "INSERT INTO people (id, name, gender, privilege, congregation, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO people (id, name, gender, privilege, congregation, phone, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             pid,
             name,
             str(fields.get("gender", "") or ""),
             str(fields.get("privilege", "") or ""),
             cong,
+            str(fields.get("phone", "") or ""),
             datetime.now().isoformat(timespec="seconds"),
         ),
     )
@@ -774,7 +778,7 @@ def add_names(
 def load_volunteers(db: Database, key: str) -> list:
     return db.rows(
         """SELECT a.id, a.person_id, p.name, p.gender, p.privilege, p.congregation,
-                  a.dept, a.shift, a.status, a.notes
+                  p.phone, a.dept, a.shift, a.status, a.notes
            FROM assignments a JOIN people p ON p.id = a.person_id
            WHERE a.event_key = ? AND a.removed_at IS NULL
            ORDER BY a.dept, a.shift, p.name""",
@@ -817,8 +821,16 @@ def _repoint_person(db: Database, person_id: str, fields: dict) -> str:
         return other["id"]
 
     db.run(
-        "UPDATE people SET name = ?, gender = ?, privilege = ?, congregation = ? WHERE id = ?",
-        (fields["name"], fields["gender"], fields["privilege"], fields["congregation"], person_id),
+        "UPDATE people SET name = ?, gender = ?, privilege = ?, congregation = ?, phone = ? "
+        "WHERE id = ?",
+        (
+            fields["name"],
+            fields["gender"],
+            fields["privilege"],
+            fields["congregation"],
+            fields["phone"],
+            person_id,
+        ),
     )
     return person_id
 

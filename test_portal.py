@@ -44,6 +44,7 @@ def person(name, dept="Parking", shift="Morning", status="Confirmed", cong="Kane
         "gender": kw.get("gender", "Female"),
         "privilege": kw.get("privilege", "Publisher"),
         "congregation": cong,
+        "phone": kw.get("phone", ""),
         "dept": dept,
         "shift": shift,
         "status": status,
@@ -116,6 +117,39 @@ def test_correcting_a_spelling_is_not_a_delete_and_add(db):
     assert len(after) == 1
     assert after[0]["person_id"] == row["person_id"]  # same person, new spelling
     assert not store.load_removed(db, KEY)
+
+
+def test_a_number_is_kept_with_the_person_not_the_assignment(db):
+    store.save_volunteers(db, KEY, [person("Ama Tetteh", phone="024 555 0101")])
+    assert store.load_volunteers(db, KEY)[0]["phone"] == "024 555 0101"
+
+    row = store.load_volunteers(db, KEY)[0]
+    edited = person("Ama Tetteh", phone="024 555 0199")
+    edited["id"] = row["id"]
+    store.save_volunteers(db, KEY, [edited])
+
+    after = store.load_volunteers(db, KEY)
+    assert len(after) == 1
+    assert after[0]["phone"] == "024 555 0199"
+    assert after[0]["person_id"] == row["person_id"]
+
+
+def test_an_older_database_gains_the_phone_column(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "DB_FILE", tmp_path / "old.db")
+    monkeypatch.setattr(store, "MIGRATIONS", [(1, [])])
+    old = store.Database(None)
+    old.run(
+        "CREATE TABLE IF NOT EXISTS people_legacy (id TEXT)"
+    )  # a database that stopped at step 1
+    assert old.version() == 1
+
+    monkeypatch.undo()
+    monkeypatch.setattr(store, "DB_FILE", tmp_path / "old.db")
+    upgraded = store.Database(None)
+    assert upgraded.version() >= 2
+    store.create_event(upgraded, KEY, DAY, actor="test")
+    store.save_volunteers(upgraded, KEY, [person("Ama Tetteh", phone="024")])
+    assert store.load_volunteers(upgraded, KEY)[0]["phone"] == "024"
 
 
 def test_two_people_with_the_same_name_stay_apart(db):
@@ -327,11 +361,20 @@ def test_old_log_entries_are_pruned(db):
 def frame():
     return pd.DataFrame(
         [
-            ("Yaw Boateng", "Male", "Servant", "Chorkor Ga", "Parking", "Afternoon", "Confirmed"),
-            ("Ama Tetteh", "Female", "Publisher", "Kaneshie Ga", "Parking", "Morning", "Confirmed"),
-            ("Nii Armah", "Male", "Elder", "Mataheko Ga", "Parking", "Early setup", "Confirmed"),
+            ("Yaw Boateng", "Male", "Servant", "Chorkor Ga", "024 1", "Parking", "Afternoon", "Confirmed"),
+            ("Ama Tetteh", "Female", "Publisher", "Kaneshie Ga", "024 2", "Parking", "Morning", "Confirmed"),
+            ("Nii Armah", "Male", "Elder", "Mataheko Ga", "", "Parking", "Early setup", "Confirmed"),
         ],
-        columns=["Name", "Gender", "Privilege", "Congregation", "Department", "Shift", "Status"],
+        columns=[
+            "Name",
+            "Gender",
+            "Privilege",
+            "Congregation",
+            "Phone",
+            "Department",
+            "Shift",
+            "Status",
+        ],
     )
 
 
@@ -360,6 +403,7 @@ def test_master_list_carries_the_oversight_names(frame, ctx):
     assert "Overseer: K. Mensah" in html
     assert "Keymen: T. Addo" in html
     assert "Kaneshie Ga" in html
+    assert "024 2" in html  # the number travels with the master list
 
 
 def test_rotation_puts_each_shift_in_its_own_column(frame, ctx):
@@ -370,7 +414,16 @@ def test_rotation_puts_each_shift_in_its_own_column(frame, ctx):
 
 def test_empty_data_still_produces_usable_files(ctx):
     empty = pd.DataFrame(
-        columns=["Name", "Gender", "Privilege", "Congregation", "Department", "Shift", "Status"]
+        columns=[
+            "Name",
+            "Gender",
+            "Privilege",
+            "Congregation",
+            "Phone",
+            "Department",
+            "Shift",
+            "Status",
+        ]
     )
     assert "Master volunteer list" in docs.master_list_html(empty, ctx)
     assert docs.master_csv(empty, ctx).startswith("Department,")

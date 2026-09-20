@@ -22,7 +22,7 @@ SOFT = "5B6B7C"
 LINE = "DCD8CF"
 PAPER = "F7F5F0"
 
-MASTER_HEADS = ["", "Name", "Congregation", "Gender", "Privilege", "Shift", "Status"]
+MASTER_HEADS = ["", "Name", "Congregation", "Phone", "Gender", "Privilege", "Shift", "Status"]
 
 
 def in_shift_order(rows: pd.DataFrame, ctx: dict) -> pd.DataFrame:
@@ -43,6 +43,17 @@ def _oversight(ctx: dict, dept: str) -> str:
     if d.get("keymen"):
         bits.append(f"Keymen: {d['keymen']}")
     return "   ·   ".join(bits) or "No oversight recorded"
+
+
+def _subtitle_lines(ctx: dict, extra: str = "") -> list:
+    """Two lines for the PDF masthead — the assembly's full name plus the date
+    runs off the page on one."""
+    venue = f"   ·   {ctx['venue']}" if ctx.get("venue") else ""
+    return [
+        f"{ctx.get('part_label', ctx['part'])}, {ctx['year']}",
+        f"{ctx['event_date']:%A, %d %B %Y}{venue}{extra}   ·   "
+        f"printed {ctx['today']:%d %B %Y}",
+    ]
 
 
 def _subtitle(ctx: dict, extra: str = "") -> str:
@@ -256,7 +267,7 @@ def master_docx(frame: pd.DataFrame, ctx: dict) -> bytes:
 
     doc = _document(ctx)
     _masthead(doc, "Master volunteer list", ctx, f"   ·   {len(frame)} volunteers")
-    widths = [Cm(0.8), Cm(4.8), Cm(4.0), Cm(1.8), Cm(2.1), Cm(2.6), Cm(2.3)]
+    widths = [Cm(0.8), Cm(3.9), Cm(3.2), Cm(2.4), Cm(1.4), Cm(1.8), Cm(2.1), Cm(2.0)]
 
     for dept in ctx["dept_order"]:
         rows = in_shift_order(frame[frame["Department"] == dept], ctx)
@@ -271,6 +282,7 @@ def master_docx(frame: pd.DataFrame, ctx: dict) -> bytes:
                     i,
                     r["Name"],
                     r["Congregation"],
+                    r.get("Phone", ""),
                     r["Gender"],
                     r["Privilege"],
                     r["Shift"],
@@ -361,13 +373,14 @@ def _pdf_chrome(title: str, ctx: dict, extra: str = ""):
         width, height = A4
         if canvas.getPageNumber() == 1:
             canvas.setFillColor(HexColor(f"#{INK}"))
-            canvas.rect(0, height - 34 * mm, width, 34 * mm, stroke=0, fill=1)
+            canvas.rect(0, height - 36 * mm, width, 36 * mm, stroke=0, fill=1)
             canvas.setFillColor(white)
             canvas.setFont("Helvetica-Bold", 20)
-            canvas.drawString(16 * mm, height - 19 * mm, title)
+            canvas.drawString(16 * mm, height - 18 * mm, title)
             canvas.setFillColor(HexColor("#D8DCE1"))
             canvas.setFont("Helvetica", 8.5)
-            canvas.drawString(16 * mm, height - 26 * mm, _subtitle(ctx, extra))
+            for i, line in enumerate(_subtitle_lines(ctx, extra)):
+                canvas.drawString(16 * mm, height - (24 + i * 5) * mm, line)
 
         canvas.setFillColor(HexColor(f"#{SOFT}"))
         canvas.setFont("Helvetica", 8)
@@ -424,7 +437,7 @@ def _pdf_build(story, title: str, ctx: dict, extra: str = "") -> bytes:
             PageTemplate(
                 id="first",
                 frames=[
-                    Frame(side, foot, width - 2 * side, height - 42 * mm - foot, id="f1")
+                    Frame(side, foot, width - 2 * side, height - 44 * mm - foot, id="f1")
                 ],
                 onPage=chrome,
             ),
@@ -446,7 +459,7 @@ def master_pdf(frame: pd.DataFrame, ctx: dict) -> bytes:
     from reportlab.platypus import KeepTogether, Paragraph
 
     styles = _pdf_styles()
-    widths = [8 * mm, 40 * mm, 34 * mm, 16 * mm, 20 * mm, 24 * mm, 20 * mm]
+    widths = [8 * mm, 33 * mm, 30 * mm, 24 * mm, 14 * mm, 18 * mm, 27 * mm, 24 * mm]
     story = []
 
     for dept in ctx["dept_order"]:
@@ -459,7 +472,16 @@ def master_pdf(frame: pd.DataFrame, ctx: dict) -> bytes:
             _pdf_table(
                 MASTER_HEADS,
                 [
-                    [i, r["Name"], r["Congregation"], r["Gender"], r["Privilege"], r["Shift"], r["Status"]]
+                    [
+                        i,
+                        r["Name"],
+                        r["Congregation"],
+                        r.get("Phone", ""),
+                        r["Gender"],
+                        r["Privilege"],
+                        r["Shift"],
+                        r["Status"],
+                    ]
                     for i, (_, r) in enumerate(rows.iterrows(), start=1)
                 ],
                 widths,
