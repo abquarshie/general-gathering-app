@@ -22,7 +22,7 @@ SOFT = "5B6B7C"
 LINE = "DCD8CF"
 PAPER = "F7F5F0"
 
-MASTER_HEADS = ["", "Name", "Congregation", "Phone", "Gender", "Privilege", "Shift", "Status"]
+MASTER_HEADS = ["", "Name", "Congregation", "Phone", "Gender", "Privilege", "Shift", "Status", "Present"]
 
 
 def in_shift_order(rows: pd.DataFrame, ctx: dict) -> pd.DataFrame:
@@ -267,7 +267,7 @@ def master_docx(frame: pd.DataFrame, ctx: dict) -> bytes:
 
     doc = _document(ctx)
     _masthead(doc, "Master volunteer list", ctx, f"   ·   {len(frame)} volunteers")
-    widths = [Cm(0.8), Cm(3.9), Cm(3.2), Cm(2.4), Cm(1.4), Cm(1.8), Cm(2.1), Cm(2.0)]
+    widths = [Cm(0.8), Cm(3.6), Cm(2.9), Cm(2.3), Cm(1.3), Cm(1.7), Cm(2.0), Cm(1.8), Cm(1.4)]
 
     for dept in ctx["dept_order"]:
         rows = in_shift_order(frame[frame["Department"] == dept], ctx)
@@ -287,6 +287,7 @@ def master_docx(frame: pd.DataFrame, ctx: dict) -> bytes:
                     r["Privilege"],
                     r["Shift"],
                     r["Status"],
+                    "",
                 ]
                 for i, (_, r) in enumerate(rows.iterrows(), start=1)
             ],
@@ -325,7 +326,9 @@ def rotation_docx(frame: pd.DataFrame, ctx: dict) -> bytes:
         tail = doc.add_paragraph()
         tail.paragraph_format.space_before = Pt(3)
         counts = tail.add_run(
-            "   ·   ".join(f"{c}: {(table[c] != '').sum()}" for c in table.columns)
+            "   ·   ".join(
+                f"{c}: {(table[c] != '').sum()} assigned, ____ present" for c in table.columns
+            )
         )
         counts.font.size = Pt(8.5)
         counts.font.color.rgb = RGBColor.from_string(SOFT)
@@ -362,15 +365,15 @@ def _pdf_styles():
     }
 
 
-def _pdf_chrome(title: str, ctx: dict, extra: str = ""):
-    """Masthead on the first page, page number on every page."""
+def _pdf_chrome(title: str, ctx: dict, extra: str = "", landscape_page: bool = False):
+    """Masthead on the first page, a running header and page X of Y after it."""
     from reportlab.lib.colors import HexColor, white
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
 
     def draw(canvas, doc):
         canvas.saveState()
-        width, height = A4
+        width, height = (A4[1], A4[0]) if landscape_page else A4
         if canvas.getPageNumber() == 1:
             canvas.setFillColor(HexColor(f"#{INK}"))
             canvas.rect(0, height - 36 * mm, width, 36 * mm, stroke=0, fill=1)
@@ -382,9 +385,22 @@ def _pdf_chrome(title: str, ctx: dict, extra: str = ""):
             for i, line in enumerate(_subtitle_lines(ctx, extra)):
                 canvas.drawString(16 * mm, height - (24 + i * 5) * mm, line)
 
+        else:
+            # a page handed round on its own should say what it is
+            canvas.setFillColor(HexColor(f"#{SOFT}"))
+            canvas.setFont("Helvetica", 8)
+            canvas.drawString(16 * mm, height - 10 * mm, f"{title} — {ctx.get('scope', '')}".strip(" —"))
+            canvas.setStrokeColor(HexColor(f"#{LINE}"))
+            canvas.setLineWidth(0.4)
+            canvas.line(16 * mm, height - 12 * mm, width - 16 * mm, height - 12 * mm)
+
         canvas.setFillColor(HexColor(f"#{SOFT}"))
         canvas.setFont("Helvetica", 8)
-        canvas.drawRightString(width - 16 * mm, 10 * mm, str(canvas.getPageNumber()))
+        total = getattr(canvas, "_page_total", None)
+        page = canvas.getPageNumber()
+        canvas.drawRightString(
+            width - 16 * mm, 10 * mm, f"Page {page} of {total}" if total else str(page)
+        )
         canvas.restoreState()
 
     return draw
@@ -416,41 +432,59 @@ def _pdf_table(headings: list, rows: list, widths: list):
     return table
 
 
-def _pdf_build(story, title: str, ctx: dict, extra: str = "") -> bytes:
-    """First page leaves room for the masthead; later pages start at the top."""
-    from reportlab.lib.pagesizes import A4
+class _Counted:
+    """Carries the final page count back into the footer on a second pass."""
+
+    def __init__(self, total=None):
+        self.total = total
+
+
+def _pdf_build(
+    story_maker, title: str, ctx: dict, extra: str = "", landscape_page: bool = False
+) -> bytes:
+    """First page leaves room for the masthead; later pages get a running header.
+
+    Built twice: the first pass counts the pages, the second prints
+    "Page 2 of 7" now that the total is known.
+    """
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import mm
     from reportlab.platypus import BaseDocTemplate, Frame, NextPageTemplate, PageTemplate
 
-    buffer = io.BytesIO()
-    width, height = A4
-    side, foot = 16 * mm, 16 * mm
-    doc = BaseDocTemplate(
-        buffer,
-        pagesize=A4,
-        title=f"{title} — {ctx.get('part_label', ctx['part'])} {ctx['year']}",
-        author="Assembly Portal",
-    )
-    chrome = _pdf_chrome(title, ctx, extra)
-    doc.addPageTemplates(
-        [
-            PageTemplate(
-                id="first",
-                frames=[
-                    Frame(side, foot, width - 2 * side, height - 44 * mm - foot, id="f1")
-                ],
-                onPage=chrome,
-            ),
-            PageTemplate(
-                id="later",
-                frames=[
-                    Frame(side, foot, width - 2 * side, height - 18 * mm - foot, id="f2")
-                ],
-                onPage=chrome,
-            ),
-        ]
-    )
-    doc.build([NextPageTemplate("later")] + story)
+    size = landscape(A4) if landscape_page else A4
+    total = None
+    for _ in range(2):
+        buffer = io.BytesIO()
+        width, height = size
+        side, foot = 16 * mm, 16 * mm
+        doc = BaseDocTemplate(
+            buffer,
+            pagesize=size,
+            title=f"{title} — {ctx.get('part_label', ctx['part'])} {ctx['year']}",
+            author="Assembly Portal",
+        )
+        chrome = _pdf_chrome(title, ctx, extra, landscape_page)
+
+        def on_page(canvas, doc_, _total=total, _chrome=chrome):
+            canvas._page_total = _total
+            _chrome(canvas, doc_)
+
+        doc.addPageTemplates(
+            [
+                PageTemplate(
+                    id="first",
+                    frames=[Frame(side, foot, width - 2 * side, height - 44 * mm - foot, id="f1")],
+                    onPage=on_page,
+                ),
+                PageTemplate(
+                    id="later",
+                    frames=[Frame(side, foot, width - 2 * side, height - 20 * mm - foot, id="f2")],
+                    onPage=on_page,
+                ),
+            ]
+        )
+        doc.build([NextPageTemplate("later")] + story_maker())
+        total = doc.page
     return buffer.getvalue()
 
 
@@ -459,76 +493,85 @@ def master_pdf(frame: pd.DataFrame, ctx: dict) -> bytes:
     from reportlab.platypus import KeepTogether, Paragraph
 
     styles = _pdf_styles()
-    widths = [8 * mm, 33 * mm, 30 * mm, 24 * mm, 14 * mm, 18 * mm, 27 * mm, 24 * mm]
-    story = []
+    widths = [8 * mm, 31 * mm, 27 * mm, 22 * mm, 13 * mm, 17 * mm, 24 * mm, 21 * mm, 15 * mm]
 
-    for dept in ctx["dept_order"]:
-        rows = in_shift_order(frame[frame["Department"] == dept], ctx)
-        if rows.empty:
-            continue
-        block = [
-            Paragraph(dept, styles["dept"]),
-            Paragraph(_oversight(ctx, dept), styles["lead"]),
-            _pdf_table(
-                MASTER_HEADS,
-                [
+    def build_story():
+        story = []
+        for dept in ctx["dept_order"]:
+            rows = in_shift_order(frame[frame["Department"] == dept], ctx)
+            if rows.empty:
+                continue
+            block = [
+                Paragraph(dept, styles["dept"]),
+                Paragraph(_oversight(ctx, dept), styles["lead"]),
+                _pdf_table(
+                    MASTER_HEADS,
                     [
-                        i,
-                        r["Name"],
-                        r["Congregation"],
-                        r.get("Phone", ""),
-                        r["Gender"],
-                        r["Privilege"],
-                        r["Shift"],
-                        r["Status"],
-                    ]
-                    for i, (_, r) in enumerate(rows.iterrows(), start=1)
-                ],
-                widths,
-            ),
-            Paragraph(f"{len(rows)} volunteers", styles["lead"]),
-        ]
-        story.append(KeepTogether(block) if len(rows) <= 12 else block[0])
-        if len(rows) > 12:
-            story.extend(block[1:])
+                        [
+                            i,
+                            r["Name"],
+                            r["Congregation"],
+                            r.get("Phone", ""),
+                            r["Gender"],
+                            r["Privilege"],
+                            r["Shift"],
+                            r["Status"],
+                            "",
+                        ]
+                        for i, (_, r) in enumerate(rows.iterrows(), start=1)
+                    ],
+                    widths,
+                ),
+                Paragraph(f"{len(rows)} volunteers", styles["lead"]),
+            ]
+            if len(rows) <= 12:
+                story.append(KeepTogether(block))
+            else:
+                story.extend(block)
+        return story or [Paragraph("No volunteers recorded.", styles["lead"])]
 
-    if not story:
-        story = [Paragraph("No volunteers recorded.", styles["lead"])]
-    return _pdf_build(story, "Master volunteer list", ctx, f"   ·   {len(frame)} volunteers")
+    return _pdf_build(
+        build_story, "Master volunteer list", ctx, f"   ·   {len(frame)} volunteers"
+    )
 
 
 def rotation_pdf(frame: pd.DataFrame, ctx: dict) -> bytes:
+    """Landscape: three or four shift columns need the width."""
     from reportlab.lib.units import mm
     from reportlab.platypus import KeepTogether, Paragraph
 
     styles = _pdf_styles()
     shifts = list(ctx["shifts"])
-    span = 162 - 8
+    span = 250 - 8
     widths = [8 * mm] + [(span / max(len(shifts), 1)) * mm] * len(shifts)
-    story = []
 
-    for dept in ctx["dept_order"]:
-        table = rotation_frame(frame, ctx, dept)
-        if table.empty:
-            continue
-        heads = [""] + [f"{n}  {ctx['hours'].get(n, '')}".strip() for n in table.columns]
-        block = [
-            Paragraph(dept, styles["dept"]),
-            Paragraph(_oversight(ctx, dept), styles["lead"]),
-            _pdf_table(
-                heads,
-                [[i + 1, *row] for i, row in enumerate(table.itertuples(index=False))],
-                widths,
-            ),
-            Paragraph(
-                "   ·   ".join(f"{c}: {(table[c] != '').sum()}" for c in table.columns),
-                styles["lead"],
-            ),
-        ]
-        story.append(KeepTogether(block) if len(table) <= 12 else block[0])
-        if len(table) > 12:
-            story.extend(block[1:])
+    def build_story():
+        story = []
+        for dept in ctx["dept_order"]:
+            table = rotation_frame(frame, ctx, dept)
+            if table.empty:
+                continue
+            heads = [""] + [f"{n}  {ctx['hours'].get(n, '')}".strip() for n in table.columns]
+            block = [
+                Paragraph(dept, styles["dept"]),
+                Paragraph(_oversight(ctx, dept), styles["lead"]),
+                _pdf_table(
+                    heads,
+                    [[i + 1, *row] for i, row in enumerate(table.itertuples(index=False))],
+                    widths,
+                ),
+                Paragraph(
+                    "   ·   ".join(
+                        f"{c}: {(table[c] != '').sum()} assigned, ____ present"
+                        for c in table.columns
+                    ),
+                    styles["lead"],
+                ),
+            ]
+            if len(table) <= 12:
+                story.append(KeepTogether(block))
+            else:
+                story.extend(block)
+        return story or [Paragraph("No volunteers recorded.", styles["lead"])]
 
-    if not story:
-        story = [Paragraph("No volunteers recorded.", styles["lead"])]
-    return _pdf_build(story, "Department rotation list", ctx)
+    return _pdf_build(build_story, "Department rotation list", ctx, landscape_page=True)

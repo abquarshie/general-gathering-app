@@ -85,6 +85,7 @@ SCHEMA = [
         shift      TEXT DEFAULT '',
         status     TEXT DEFAULT 'Invited',
         notes      TEXT DEFAULT '',
+        status_at  TEXT,
         removed_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS changes (
@@ -110,6 +111,7 @@ SCHEMA = [
 MIGRATIONS: list = [
     (1, []),
     (2, ["ALTER TABLE people ADD COLUMN phone TEXT DEFAULT ''"]),
+    (3, ["ALTER TABLE assignments ADD COLUMN status_at TEXT"]),
 ]
 
 
@@ -695,9 +697,17 @@ def add_person_to_event(
     if existing:
         return
     db.run(
-        "INSERT INTO assignments (id, event_key, person_id, dept, shift, status, notes) "
-        "VALUES (?, ?, ?, ?, ?, 'Invited', '')",
-        (str(uuid.uuid4()), key, person_id, dept, shift),
+        "INSERT INTO assignments "
+        "(id, event_key, person_id, dept, shift, status, notes, status_at) "
+        "VALUES (?, ?, ?, ?, ?, 'Invited', '', ?)",
+        (
+            str(uuid.uuid4()),
+            key,
+            person_id,
+            dept,
+            shift,
+            datetime.now().isoformat(timespec="seconds"),
+        ),
     )
     log(db, actor, key, dept, "a returning volunteer added")
 
@@ -757,9 +767,10 @@ def add_names(
         taken.add(pid)
         new_rows.append(
             (
-                "INSERT INTO assignments (id, event_key, person_id, dept, shift, status, notes) "
-                "VALUES (?, ?, ?, ?, ?, 'Invited', '')",
-                (str(uuid.uuid4()), key, pid, dept, shift),
+                "INSERT INTO assignments "
+                "(id, event_key, person_id, dept, shift, status, notes, status_at) "
+                "VALUES (?, ?, ?, ?, ?, 'Invited', '', ?)",
+                (str(uuid.uuid4()), key, pid, dept, shift, now),
             )
         )
 
@@ -778,7 +789,7 @@ def add_names(
 def load_volunteers(db: Database, key: str) -> list:
     return db.rows(
         """SELECT a.id, a.person_id, p.name, p.gender, p.privilege, p.congregation,
-                  p.phone, a.dept, a.shift, a.status, a.notes
+                  p.phone, a.dept, a.shift, a.status, a.notes, a.status_at
            FROM assignments a JOIN people p ON p.id = a.person_id
            WHERE a.event_key = ? AND a.removed_at IS NULL
            ORDER BY a.dept, a.shift, p.name""",
@@ -855,11 +866,14 @@ def save_volunteers(db: Database, key: str, rows: list, actor: str = "") -> dict
         aid = str(row.get("id") or "").strip()
         before = existing.get(aid)
 
+        # microseconds, so two status changes in the same second stay distinct
+        now = datetime.now().isoformat()
         if before is None:
             db.run(
-                "INSERT INTO assignments (id, event_key, person_id, dept, shift, status, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), key, ensure_person(db, person), *fields),
+                "INSERT INTO assignments "
+                "(id, event_key, person_id, dept, shift, status, notes, status_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), key, ensure_person(db, person), *fields, now),
             )
             counts["added"] += 1
             continue
@@ -872,9 +886,12 @@ def save_volunteers(db: Database, key: str, rows: list, actor: str = "") -> dict
             pid = _repoint_person(db, before["person_id"], person)
             db.run("UPDATE assignments SET person_id = ? WHERE id = ?", (pid, aid))
         if was != fields:
+            moved = (before.get("status") or "") != fields[2]
             db.run(
-                "UPDATE assignments SET dept = ?, shift = ?, status = ?, notes = ? WHERE id = ?",
-                (*fields, aid),
+                "UPDATE assignments SET dept = ?, shift = ?, status = ?, notes = ?"
+                + (", status_at = ?" if moved else "")
+                + " WHERE id = ?",
+                (*fields, now, aid) if moved else (*fields, aid),
             )
         if person_changed or was != fields:
             counts["changed"] += 1
@@ -898,13 +915,20 @@ def save_volunteers(db: Database, key: str, rows: list, actor: str = "") -> dict
 # ---------------------------------------------------------------------------
 
 
-def copy_forward(db: Database, source: str, target: str, actor: str = "", reset_status: str = "Invited") -> dict:
+def copy_forward(
+    db: Database,
+    source: str,
+    target: str,
+    actor: str = "",
+    reset_status: str = "Invited",
+    confirmed_only: bool = True,
+) -> dict:
     """Copy departments, shifts, targets and people from an earlier gathering.
 
     Assignments point at the same person records, so service history follows.
     Statuses reset — last year's yes is not this year's yes.
     """
-    counts = {"volunteers": 0, "departments": 0, "shifts": 0, "targets": 0}
+    counts = {"volunteers": 0, "departments": 0, "shifts": 0, "targets": 0, "skipped": 0}
     pairs = []
 
     for dept, f in load_departments(db, source).items():
@@ -942,12 +966,25 @@ def copy_forward(db: Database, source: str, target: str, actor: str = "", reset_
         )
         counts["targets"] += 1
 
+    now = datetime.now().isoformat(timespec="seconds")
     for v in load_volunteers(db, source):
+        if confirmed_only and v["status"] != "Confirmed":
+            counts["skipped"] += 1
+            continue
         pairs.append(
             (
-                "INSERT INTO assignments (id, event_key, person_id, dept, shift, status, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?, '')",
-                (str(uuid.uuid4()), target, v["person_id"], v["dept"], v["shift"], reset_status),
+                "INSERT INTO assignments "
+                "(id, event_key, person_id, dept, shift, status, notes, status_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, '', ?)",
+                (
+                    str(uuid.uuid4()),
+                    target,
+                    v["person_id"],
+                    v["dept"],
+                    v["shift"],
+                    reset_status,
+                    now,
+                ),
             )
         )
         counts["volunteers"] += 1

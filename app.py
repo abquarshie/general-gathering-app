@@ -287,6 +287,12 @@ with st.sidebar:
             format_func=lambda k: labels.get(k, k),
             key="copy_src",
         )
+        only_confirmed_copy = st.checkbox(
+            "Only those who served last time",
+            value=True,
+            key="copy_conf",
+            help="Leaves behind anyone who was unavailable or never replied",
+        )
         if st.button("Create", type="primary"):
             new_key = f"{new_part} {int(new_year)}"
             if store.event_exists(DB, new_key):
@@ -294,9 +300,17 @@ with st.sidebar:
             else:
                 store.create_event(DB, new_key, new_date, actor=actor)
                 if source != "Start empty":
-                    counts = store.copy_forward(DB, source, new_key, actor=actor)
-                    st.success(
-                        f"{counts['volunteers']} people carried forward, all set back to Invited."
+                    counts = store.copy_forward(
+                        DB,
+                        source,
+                        new_key,
+                        actor=actor,
+                        confirmed_only=only_confirmed_copy,
+                    )
+                    flash(
+                        f"{counts['volunteers']} people carried forward, all set back to "
+                        "Invited."
+                        + (f" {counts['skipped']} left behind." if counts.get("skipped") else "")
                     )
                 st.session_state.event_key = new_key
                 st.rerun()
@@ -348,13 +362,6 @@ vol_rows = bundle["volunteers"]
 event_date = date.fromisoformat(event["event_date"])
 part, year = event_key.rsplit(" ", 1)
 
-with st.sidebar:
-    new_date2 = st.date_input("Assembly date", value=event_date, key=f"date_{event_key}")
-    new_venue = st.text_input("Venue", value=event.get("venue") or "", key=f"venue_{event_key}")
-    if new_date2 != event_date or new_venue != (event.get("venue") or ""):
-        store.save_event(DB, event_key, new_date2, new_venue, event["checklist"], actor=actor)
-        st.rerun()
-
 if not st.session_state.get("pruned"):
     try:
         store.prune_changes(DB)
@@ -373,20 +380,36 @@ late = days_to_deadline < 0
 # ---------------------------------------------------------------------------
 
 
+def waiting_days(stamp) -> int | None:
+    if not stamp:
+        return None
+    try:
+        return (datetime.now() - datetime.fromisoformat(str(stamp))).days
+    except ValueError:
+        return None
+
+
 def volunteers_df() -> pd.DataFrame:
     """The grid, with each row's assignment id carried along out of sight."""
     if not vol_rows:
-        return pd.DataFrame(columns=["id"] + GRID_COLUMNS)
+        return pd.DataFrame(columns=["id"] + GRID_COLUMNS + ["_since"])
     rows = [
-        {"id": r["id"], **{k: r.get(v, "") or "" for k, v in DB_FIELDS.items()}} for r in vol_rows
+        {
+            "id": r["id"],
+            **{k: r.get(v, "") or "" for k, v in DB_FIELDS.items()},
+            "_since": waiting_days(r.get("status_at")),
+        }
+        for r in vol_rows
     ]
-    return pd.DataFrame(rows, columns=["id"] + GRID_COLUMNS).astype(str)
+    frame = pd.DataFrame(rows, columns=["id"] + GRID_COLUMNS + ["_since"])
+    frame[["id"] + GRID_COLUMNS] = frame[["id"] + GRID_COLUMNS].astype(str)
+    return frame
 
 
 def save_grid(frame: pd.DataFrame) -> None:
     rows = [
         {"id": r.get("id", ""), **{DB_FIELDS[c]: str(r.get(c, "") or "") for c in GRID_COLUMNS}}
-        for r in frame.fillna("").to_dict("records")
+        for r in frame.drop(columns=["_since"], errors="ignore").fillna("").to_dict("records")
     ]
     store.save_volunteers(DB, event_key, rows, actor=actor)
 
@@ -508,6 +531,46 @@ tab_dash, tab_depts, tab_vols, tab_docs, tab_settings = st.tabs(
 # ---------------------------------------------------------------------------
 
 with tab_dash:
+    staffing = staffing_rows()
+    short_total = sum(s["short"] for s in staffing)
+    unmanned = [d for d in ALL_DEPTS if not dept_record(d).get("overseer")]
+    items_now = CHECKLIST[role]
+    undone = sum(1 for k, _ in items_now if not event["checklist"].get(k))
+
+    urgent = []
+    if not late and days_to_deadline <= 21:
+        urgent.append(f"recruitment closes in {days_to_deadline} days")
+    elif late:
+        urgent.append("recruitment has closed")
+    if short_total:
+        worst = max(staffing, key=lambda s: s["short"])
+        urgent.append(
+            f"{short_total} short overall, worst in {worst['Department']} ({worst['Shift']})"
+        )
+    if unmanned:
+        urgent.append(
+            f"no overseer named for {', '.join(unmanned[:3])}"
+            + (f" and {len(unmanned) - 3} more" if len(unmanned) > 3 else "")
+        )
+    if undone:
+        urgent.append(f"{undone} checklist items left")
+
+    st.markdown(
+        '<div class="row behind" style="border-bottom:none"><span>'
+        + ("Nothing pressing today." if not urgent else "Today: " + "; ".join(urgent) + ".")
+        + "</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("Date and venue"):
+        e1, e2 = st.columns(2)
+        new_date2 = e1.date_input("Assembly date", value=event_date, key=f"date_{event_key}")
+        new_venue = e2.text_input("Venue", value=event.get("venue") or "", key=f"venue_{event_key}")
+        if new_date2 != event_date or new_venue != (event.get("venue") or ""):
+            store.save_event(DB, event_key, new_date2, new_venue, event["checklist"], actor=actor)
+            flash("Assembly details saved.")
+            st.rerun()
+
     left, right = st.columns(2, gap="large")
 
     with left:
@@ -537,7 +600,6 @@ with tab_dash:
 
     with right:
         st.markdown("#### Departments")
-        staffing = staffing_rows()
         by_dept: dict[str, dict[str, int]] = {}
         for s in staffing:
             agg = by_dept.setdefault(s["Department"], {"have": 0, "needed": 0, "short": 0})
@@ -652,6 +714,7 @@ with tab_depts:
                 },
                 actor=actor,
             )
+            flash(f"{dept} saved.")
             st.rerun()
 
     st.markdown("#### How many are needed")
@@ -703,6 +766,7 @@ with tab_depts:
             ],
             actor=actor,
         )
+        flash(f"Headcount for {dept} saved.")
         st.rerun()
 
     st.markdown("#### Volunteers in this department")
@@ -714,12 +778,28 @@ with tab_depts:
             unsafe_allow_html=True,
         )
     else:
-        counts = assigned.groupby("Shift").size().to_dict()
-        line = " &nbsp;·&nbsp; ".join(
-            f"{n} {counts.get(n, 0)}" for n in shift_names() if counts.get(n, 0)
+        confirmed = assigned[assigned["Status"] == "Confirmed"]
+        wanted_now = {
+            t["Shift"]: t["Needed"] for t in target_rows if t["Department"] == dept and t["Needed"]
+        }
+        bits = []
+        for n in shift_names():
+            have_n = int((confirmed["Shift"] == n).sum())
+            need_n = wanted_now.get(n, 0)
+            if not (have_n or need_n):
+                continue
+            if need_n:
+                css = "short" if have_n < need_n else ""
+                over = " (over)" if have_n > need_n else ""
+                bits.append(f'{n} <span class="{css}">{have_n} of {need_n}{over}</span>')
+            else:
+                bits.append(f"{n} {have_n}")
+        st.markdown(
+            f'<p class="note">{" &nbsp;·&nbsp; ".join(bits) or "No shift assigned yet"} '
+            "&nbsp;— confirmed only</p>",
+            unsafe_allow_html=True,
         )
-        st.markdown(f'<p class="note">{line or "No shift assigned yet"}</p>', unsafe_allow_html=True)
-        st.dataframe(assigned, hide_index=True, width="stretch")
+        st.dataframe(assigned[GRID_COLUMNS], hide_index=True, width="stretch")
 
 # ---------------------------------------------------------------------------
 # Volunteers
@@ -829,7 +909,15 @@ with tab_vols:
     removed_rows = bundle["removed"]
     if removed_rows:
         with st.expander(f"Recently removed ({len(removed_rows)})"):
-            for r in removed_rows[:15]:
+            look_for = st.text_input("Find a name", key=f"rm_find_{event_key}")
+            shown = [
+                r
+                for r in removed_rows
+                if not look_for.strip() or look_for.strip().lower() in str(r["name"]).lower()
+            ]
+            if not shown:
+                st.markdown('<p class="note">No match.</p>', unsafe_allow_html=True)
+            for r in shown[:30]:
                 c1, c2 = st.columns([4, 1])
                 c1.markdown(
                     f'<div class="row"><span><span class="name">{r["name"]}</span>'
@@ -849,6 +937,10 @@ with tab_vols:
     f_dept = f2.multiselect("Department", ALL_DEPTS, key=f"f_dept_{event_key}")
     f_status = f3.multiselect("Status", STATUSES, key=f"f_status_{event_key}")
 
+    show_extra = st.checkbox(
+        "Show gender and notes", value=False, key=f"extra_{event_key}",
+        help="Kept out of the way, since they are rarely edited after entry",
+    )
     filtering = bool(search.strip() or f_dept or f_status)
     view = base
     if filtering and not base.empty:
@@ -873,7 +965,9 @@ with tab_vols:
         hide_index=True,
         width="stretch",
         key=f"vol_editor_{event_key}",
-        column_order=GRID_COLUMNS,
+        column_order=(
+            GRID_COLUMNS if show_extra else [c for c in GRID_COLUMNS if c not in ("Gender", "Notes")]
+        ),
         column_config={
             "Name": st.column_config.TextColumn(required=True, width="medium"),
             "Gender": st.column_config.SelectboxColumn(options=GENDERS, width="small"),
@@ -896,8 +990,21 @@ with tab_vols:
     else:
         result = edited_vols
 
-    if result.fillna("").to_dict("records") != base.to_dict("records"):
-        save_grid(result)
+    if result.drop(columns=["_since"], errors="ignore").fillna("").to_dict("records") != base.drop(
+        columns=["_since"], errors="ignore"
+    ).to_dict("records"):
+        counts = store.save_volunteers(
+            DB,
+            event_key,
+            [
+                {"id": r.get("id", ""), **{DB_FIELDS[c]: str(r.get(c, "") or "") for c in GRID_COLUMNS}}
+                for r in result.drop(columns=["_since"], errors="ignore").fillna("").to_dict("records")
+            ],
+            actor=actor,
+        )
+        said = ", ".join(f"{v} {k}" for k, v in counts.items() if v)
+        if said:
+            flash(said.capitalize() + ".")
         st.rerun()
 
     df = volunteers_df()
@@ -919,9 +1026,15 @@ with tab_vols:
         if empty_depts:
             st.info("No volunteers yet: " + ", ".join(empty_depts))
 
-        pending = named[named["Status"] == "Invited"]
+        pending = named[named["Status"] == "Invited"].copy()
         if not pending.empty:
-            with st.expander(f"Still to reply ({len(pending)})"):
+            pending["_since"] = pending["_since"].fillna(-1)
+            pending = pending.sort_values("_since", ascending=False)
+            longest = int(pending["_since"].max())
+            with st.expander(
+                f"Still to reply ({len(pending)})"
+                + (f" — longest waiting {longest} days" if longest > 0 else "")
+            ):
                 st.markdown(
                     f'<p class="note">{f"Recruitment closed {-days_to_deadline} days ago" if late else f"{days_to_deadline} days until recruitment closes"}.</p>',
                     unsafe_allow_html=True,
@@ -939,7 +1052,9 @@ with tab_vols:
                     lines.append(f"\n{dept_name}:")
                     for _, v in group.iterrows():
                         number = f" — {v['Phone']}" if str(v["Phone"]).strip() else ""
-                        lines.append(f"  {v['Name']} ({v['Shift']}){number}")
+                        days = int(v["_since"]) if v["_since"] and v["_since"] > 0 else 0
+                        waited = f"  [{days}d]" if days else ""
+                        lines.append(f"  {v['Name']} ({v['Shift']}){number}{waited}")
                 st.text_area("Copy into a message", "\n".join(lines), height=180, key="chase_text")
 
                 no_number = pending[pending["Phone"].str.strip() == ""]
@@ -1004,11 +1119,22 @@ with tab_docs:
     ctx = doc_context()
 
     c_top1, c_top2 = st.columns([2, 3])
+    scope_pick = c_top1.selectbox(
+        "For", ["All departments"] + ALL_DEPTS, key="doc_scope",
+        help="One department gives you the copy to hand that overseer",
+    )
     only_confirmed = c_top1.checkbox("Confirmed volunteers only", value=True, key="doc_conf")
     fmt = c_top2.radio(
         "Format", ["PDF", "Word", "Web page", "CSV"], horizontal=True, key="doc_fmt"
     )
+
     frame = named[named["Status"] == "Confirmed"] if only_confirmed and not named.empty else named
+    if scope_pick != "All departments":
+        frame = frame[frame["Department"] == scope_pick] if not frame.empty else frame
+        ctx = {**ctx, "dept_order": [scope_pick], "scope": scope_pick}
+        stem = f"{stem}_{scope_pick.replace(' ', '').replace('/', '')}"
+    else:
+        ctx = {**ctx, "scope": "All departments"}
 
     BUILDERS = {
         "PDF": (docs.master_list_pdf, docs.rotation_pdf, "pdf", "application/pdf"),

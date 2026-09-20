@@ -25,6 +25,8 @@ PRINT_CSS = """
  th, td { border-bottom:1px solid #dcd8cf; text-align:left; padding:1.6mm 2mm; vertical-align:top; }
  th { background:#f7f5f0; font-size:8.5pt; letter-spacing:.02em; }
  td.num { color:#5b6b7c; width:8mm; }
+ td.tick { width:18mm; }
+ p.foot { color:#5b6b7c; font-size:8pt; margin:6mm 0 0; }
 """
 
 
@@ -65,13 +67,14 @@ def master_list_html(frame: pd.DataFrame, ctx: dict) -> str:
         body = "".join(
             f"<tr><td class='num'>{i}</td><td>{r['Name']}</td><td>{r['Congregation']}</td>"
             f"<td>{r.get('Phone', '')}</td><td>{r['Gender']}</td><td>{r['Privilege']}</td>"
-            f"<td>{r['Shift']}</td><td>{r['Status']}</td></tr>"
+            f"<td>{r['Shift']}</td><td>{r['Status']}</td><td class='tick'></td></tr>"
             for i, (_, r) in enumerate(rows.iterrows(), start=1)
-        ) or "<tr><td colspan='8'>No volunteers recorded.</td></tr>"
+        ) or "<tr><td colspan='9'>No volunteers recorded.</td></tr>"
         sections.append(
             f"<section><h2>{dept}</h2><p class='lead'>{_lead(ctx, dept)}</p>"
             "<table><tr><th></th><th>Name</th><th>Congregation</th><th>Phone</th>"
-            f"<th>Gender</th><th>Privilege</th><th>Shift</th><th>Status</th></tr>{body}</table>"
+            f"<th>Gender</th><th>Privilege</th><th>Shift</th><th>Status</th>"
+            f"<th>Present</th></tr>{body}</table>"
             f"<p class='lead'>{len(rows)} volunteers</p></section>"
         )
     extra = f" &middot; {len(frame)} volunteers"
@@ -105,7 +108,9 @@ def rotation_html(frame: pd.DataFrame, ctx: dict) -> str:
             + "</tr>"
             for i, row in enumerate(table.itertuples(index=False))
         )
-        counts = " &nbsp;·&nbsp; ".join(f"{c}: {(table[c] != '').sum()}" for c in table.columns)
+        counts = " &nbsp;·&nbsp; ".join(
+            f"{c}: {(table[c] != '').sum()} assigned, ____ present" for c in table.columns
+        )
         sections.append(
             f"<section><h2>{dept}</h2><p class='lead'>{_lead(ctx, dept)}</p>"
             f"<table><tr><th></th>{heads}</tr>{body}</table>"

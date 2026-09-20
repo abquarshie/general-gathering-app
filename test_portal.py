@@ -152,6 +152,46 @@ def test_an_older_database_gains_the_phone_column(tmp_path, monkeypatch):
     assert store.load_volunteers(upgraded, KEY)[0]["phone"] == "024"
 
 
+def test_the_status_date_moves_only_when_the_status_does(db):
+    store.save_volunteers(db, KEY, [person("Ama Tetteh", status="Invited")])
+    row = store.load_volunteers(db, KEY)[0]
+    assert row["status_at"]
+
+    same_status = person("Ama Tetteh", status="Invited", notes="chased once")
+    same_status["id"] = row["id"]
+    store.save_volunteers(db, KEY, [same_status])
+    assert store.load_volunteers(db, KEY)[0]["status_at"] == row["status_at"]
+
+    replied = person("Ama Tetteh", status="Confirmed", notes="chased once")
+    replied["id"] = row["id"]
+    store.save_volunteers(db, KEY, [replied])
+    assert store.load_volunteers(db, KEY)[0]["status_at"] != row["status_at"]
+
+
+def test_copy_forward_can_leave_behind_those_who_did_not_serve(db):
+    store.save_volunteers(
+        db,
+        KEY,
+        [
+            person("Ama Tetteh", status="Confirmed"),
+            person("Kofi Larbi", status="Unavailable"),
+            person("Yaw Boateng", status="Invited"),
+        ],
+    )
+    later = "Part 1 2027"
+    store.create_event(db, later, datetime.date(2027, 11, 13), actor="test")
+    counts = store.copy_forward(db, KEY, later, actor="test", confirmed_only=True)
+
+    assert counts["volunteers"] == 1
+    assert counts["skipped"] == 2
+    assert names(db, later) == ["Ama Tetteh"]
+
+    everyone = "Part 2 2027"
+    store.create_event(db, everyone, datetime.date(2027, 5, 1), actor="test")
+    store.copy_forward(db, KEY, everyone, actor="test", confirmed_only=False)
+    assert len(names(db, everyone)) == 3
+
+
 def test_two_people_with_the_same_name_stay_apart(db):
     store.save_volunteers(
         db,
