@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 DB_FILE = Path("data") / "portal.db"
@@ -94,9 +94,20 @@ SCHEMA = [
         area      TEXT DEFAULT '',
         detail    TEXT DEFAULT ''
     )""",
+    """CREATE TABLE IF NOT EXISTS schema_version (
+        version    INTEGER PRIMARY KEY,
+        applied_at TEXT
+    )""",
     "CREATE INDEX IF NOT EXISTS assignments_event ON assignments (event_key)",
     "CREATE INDEX IF NOT EXISTS assignments_person ON assignments (person_id)",
     "CREATE INDEX IF NOT EXISTS changes_event ON changes (event_key, at)",
+]
+
+
+# Ordered schema steps. Never edit a released one — append a new number.
+# Step 1 is the baseline every table above already creates.
+MIGRATIONS: list = [
+    (1, []),
 ]
 
 
@@ -211,9 +222,44 @@ class Database:
 
     def setup(self) -> None:
         with self._conn() as conn:
+            conn.cursor().execute(
+                "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, at TEXT)"
+            )
+        self._meta_ready = True
+        with self._conn() as conn:
             cur = conn.cursor()
             for statement in SCHEMA:
                 cur.execute(statement)
+        self.migrate()
+
+    def version(self) -> int:
+        rows = self.rows("SELECT MAX(version) AS v FROM schema_version")
+        return int(rows[0]["v"] or 0) if rows else 0
+
+    def migrate(self) -> list:
+        """Apply any schema step this database has not seen.
+
+        SCHEMA above only creates missing tables; it cannot alter one that
+        already exists. Adding a column later means appending a step here, and
+        every database catches up on its next start.
+        """
+        applied = []
+        at = self.version()
+        for number, statements in MIGRATIONS:
+            if number <= at:
+                continue
+            for statement in statements:
+                try:
+                    self.run(statement)
+                except Exception:
+                    # a step already satisfied by SCHEMA on a fresh database
+                    pass
+            self.run(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (number, datetime.now().isoformat(timespec="seconds")),
+            )
+            applied.append(number)
+        return applied
 
     def absorb_legacy(self) -> int:
         """Move rows from the earlier single `volunteers` table, once."""
@@ -261,10 +307,11 @@ class Database:
 
 
 def log(db: Database, actor: str, event_key: str, area: str, detail: str) -> None:
+    entry_id = str(uuid.uuid4())
     db.run(
         "INSERT INTO changes (id, at, actor, event_key, area, detail) VALUES (?, ?, ?, ?, ?, ?)",
         (
-            str(uuid.uuid4()),
+            entry_id,
             datetime.now().isoformat(timespec="seconds"),
             actor or "",
             event_key,
@@ -272,16 +319,29 @@ def log(db: Database, actor: str, event_key: str, area: str, detail: str) -> Non
             detail,
         ),
     )
+    # the cache stamp is one row rather than a count, so it stays cheap forever
+    set_meta(db, f"stamp:{event_key}", entry_id)
 
 
 def data_stamp(db: Database, event_key: str) -> str:
-    """Changes when anything about this gathering does — including another
-    person's edit, since it reads the shared changes table rather than a
-    counter held in one session."""
-    row = db.rows(
-        "SELECT COUNT(*) AS n, MAX(at) AS last FROM changes WHERE event_key = ?", (event_key,)
-    )[0]
-    return f"{row['n']}:{row['last']}"
+    """Changes whenever anyone writes to this gathering.
+
+    One row lookup, not a count over the whole change log, so it does not get
+    slower as that log grows. Shared, so another person's edit invalidates a
+    cached view here too.
+    """
+    row = get_meta(db, f"stamp:{event_key}")
+    return str(row.get("v") or "new")
+
+
+def prune_changes(db: Database, months: int = 12) -> int:
+    """Drop change-log entries older than a year, so the table cannot grow
+    without limit. Nothing else reads them."""
+    cutoff = (datetime.now() - timedelta(days=30 * months)).isoformat(timespec="seconds")
+    before = db.rows("SELECT COUNT(*) AS n FROM changes WHERE at < ?", (cutoff,))[0]["n"]
+    if before:
+        db.run("DELETE FROM changes WHERE at < ?", (cutoff,))
+    return int(before)
 
 
 def recent_changes(db: Database, event_key: str, limit: int = 25) -> list:
@@ -976,14 +1036,53 @@ def describe_backup(data: dict) -> dict:
     }
 
 
+def validate_backup(data: dict) -> list:
+    """Problems that would make a restore write nonsense. Empty means fine."""
+    problems = []
+    if not isinstance(data, dict):
+        return ["The file is not a backup — expected an object at the top level."]
+    if data.get("format") != 1:
+        problems.append(f"Unknown backup format: {data.get('format')!r}.")
+    tables = data.get("tables")
+    if not isinstance(tables, dict):
+        return problems + ["The file has no tables in it."]
+
+    for name, rows in tables.items():
+        if name not in TABLES:
+            problems.append(f"Unknown table {name!r}.")
+            continue
+        if not isinstance(rows, list):
+            problems.append(f"{name} is not a list of rows.")
+            continue
+        for i, row in enumerate(rows[:200]):
+            if not isinstance(row, dict):
+                problems.append(f"{name} row {i} is not a record.")
+                break
+            missing = [c for c in TABLES[name] if not str(row.get(c, "")).strip()]
+            if missing:
+                problems.append(f"{name} row {i} has no {', '.join(missing)}.")
+                break
+
+    people = {p.get("id") for p in tables.get("people", []) if isinstance(p, dict)}
+    orphans = [
+        a
+        for a in tables.get("assignments", [])
+        if isinstance(a, dict) and a.get("person_id") not in people
+    ]
+    if orphans:
+        problems.append(f"{len(orphans)} assignments name a person the file does not contain.")
+    return problems
+
+
 def restore_all(db: Database, data: dict, mode: str = "merge", actor: str = "") -> dict:
     """Write a backup back into the database.
 
     merge   — add rows that are missing, leave anything present untouched.
     replace — empty every table first, so the database ends up matching the file.
     """
-    if data.get("format") != 1:
-        raise ValueError("This file is not a portal backup.")
+    problems = validate_backup(data)
+    if problems:
+        raise ValueError("; ".join(problems[:4]))
     tables = data.get("tables", {})
     counts = {}
     pairs: list = []

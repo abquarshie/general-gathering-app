@@ -307,6 +307,13 @@ with st.sidebar:
         store.save_event(DB, event_key, new_date2, new_venue, event["checklist"], actor=actor)
         st.rerun()
 
+if not st.session_state.get("pruned"):
+    try:
+        store.prune_changes(DB)
+    except Exception:  # noqa: BLE001 — housekeeping must never block the app
+        pass
+    st.session_state["pruned"] = True
+
 today = date.today()
 deadline = event_date - timedelta(weeks=4)
 days_out = (event_date - today).days
@@ -549,6 +556,11 @@ with tab_depts:
     scope = st.radio("Show", ["My departments", "All departments"], horizontal=True, key="scope")
     dept = st.selectbox("Department", mine if scope == "My departments" else ALL_DEPTS, key="dept_pick")
     d = dept_record(dept)
+    if DEPT_OWNER[dept] != role:
+        st.caption(
+            f"{dept} belongs to the {DEPT_OWNER[dept].lower()}. You can still edit it — "
+            "the change log records who did."
+        )
 
     with st.form(f"dept_form_{dept}"):
         c1, c2 = st.columns(2, gap="large")
@@ -1136,7 +1148,10 @@ with tab_settings:
 
     st.divider()
     st.markdown("#### Storage")
-    st.markdown(f'<p class="note">{DB.label}</p>', unsafe_allow_html=True)
+    st.markdown(
+        f'<p class="note">{DB.label} &nbsp;·&nbsp; schema version {DB.version()}</p>',
+        unsafe_allow_html=True,
+    )
     if DB.kind != "postgres":
         with st.expander("Move to Neon Postgres"):
             st.markdown(

@@ -1,17 +1,15 @@
-streamlit>=1.49
-pandas>=2.0
-bcrypt>=4.0
-
-# The two documents as Word and PDF
-python-docx>=1.1
-reportlab>=4.0
-
-# Neon Postgres. Without it the app falls back to SQLite in data/portal.db.
-psycopg[binary]>=3.1
-
-# Optional: only needed for the Push to Sheets button.
-gspread>=6.0
+# Pinned to the versions this was tested against. Bump deliberately, then
+# re-run the tests — an unpinned Streamlit has broken this app before.
+streamlit==1.64.0
+pandas==3.0.2
+bcrypt==5.0.0
 
 # Word and PDF versions of the documents
-python-docx>=1.1
-reportlab>=4.0
+python-docx==1.2.0
+reportlab==4.4.10
+
+# Neon Postgres. Without it the app falls back to SQLite in data/portal.db.
+psycopg[binary]==3.3.6
+
+# Only needed for the Push to Sheets button
+gspread==6.2.1
