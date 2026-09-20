@@ -1170,7 +1170,8 @@ with tab_settings:
                 )
 
     st.markdown(
-        f'<p class="note">{DB.queries} database calls so far this session.</p>',
+        f'<p class="note">{getattr(DB, "queries", 0)} database calls so far '
+        "this session.</p>",
         unsafe_allow_html=True,
     )
 

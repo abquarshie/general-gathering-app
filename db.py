@@ -117,6 +117,11 @@ def _dsn(secrets) -> str | None:
 
 
 class Database:
+    # class-level defaults, so an instance built by an older copy of this file
+    # and kept alive in Streamlit's resource cache still answers for them
+    queries = 0
+    _meta_ready = False
+
     def __init__(self, secrets=None):
         self.dsn = _dsn(secrets) if secrets is not None else None
         self.kind = "postgres" if self.dsn else "sqlite"
