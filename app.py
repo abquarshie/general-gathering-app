@@ -755,7 +755,7 @@ with tab_depts:
         for s, row in edited.iterrows()
     }
     wanted = {s: v for s, v in wanted.items() if any(v)}
-    if wanted != current:
+    if st.button("Save headcount", type="primary", disabled=wanted == current):
         store.save_dept_targets(
             DB,
             event_key,
@@ -990,22 +990,54 @@ with tab_vols:
     else:
         result = edited_vols
 
-    if result.drop(columns=["_since"], errors="ignore").fillna("").to_dict("records") != base.drop(
-        columns=["_since"], errors="ignore"
-    ).to_dict("records"):
-        counts = store.save_volunteers(
-            DB,
-            event_key,
-            [
-                {"id": r.get("id", ""), **{DB_FIELDS[c]: str(r.get(c, "") or "") for c in GRID_COLUMNS}}
-                for r in result.drop(columns=["_since"], errors="ignore").fillna("").to_dict("records")
-            ],
-            actor=actor,
-        )
+    def as_rows(table: pd.DataFrame) -> list:
+        return [
+            {"id": r.get("id", ""), **{DB_FIELDS[c]: str(r.get(c, "") or "") for c in GRID_COLUMNS}}
+            for r in table.drop(columns=["_since"], errors="ignore").fillna("").to_dict("records")
+        ]
+
+    pending = as_rows(result)
+    on_file = as_rows(base)
+    unsaved = pending != on_file
+
+    # Nothing is written until this button is pressed: the editor keeps the
+    # edits in the session, so typing costs no database traffic and the other
+    # overseer does not see half-finished rows.
+    save_col, discard_col, note_col = st.columns([1, 1, 4])
+    if save_col.button("Save changes", type="primary", disabled=not unsaved):
+        counts = store.save_volunteers(DB, event_key, pending, actor=actor)
         said = ", ".join(f"{v} {k}" for k, v in counts.items() if v)
-        if said:
-            flash(said.capitalize() + ".")
+        flash(said.capitalize() + "." if said else "Nothing to save.")
         st.rerun()
+
+    if discard_col.button("Discard", disabled=not unsaved):
+        st.session_state.pop(f"vol_editor_{event_key}", None)
+        st.rerun()
+
+    if unsaved:
+        added = sum(1 for r in pending if not r["id"])
+        removed = len(on_file) - sum(1 for r in pending if r["id"])
+        changed = sum(
+            1
+            for r in pending
+            if r["id"] and r != next((o for o in on_file if o["id"] == r["id"]), None)
+        )
+        parts = [
+            f"{n} {word}"
+            for n, word in ((added, "added"), (changed, "edited"), (removed, "removed"))
+            if n > 0
+        ]
+        note_col.markdown(
+            f'<p class="note" style="padding-top:.55rem"><b>Unsaved:</b> '
+            f'{", ".join(parts) or "changes"}. They are kept while you stay on this '
+            "assembly.</p>",
+            unsafe_allow_html=True,
+        )
+    else:
+        note_col.markdown(
+            '<p class="note" style="padding-top:.55rem">Everything is saved.</p>',
+            unsafe_allow_html=True,
+        )
 
     df = volunteers_df()
     named = df[df["Name"].str.strip() != ""] if not df.empty else df
